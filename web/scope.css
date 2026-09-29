@@ -191,7 +191,8 @@
     .hex-preview { display:grid; grid-template-columns:repeat(3,1fr); gap:7px; margin:0 0 12px; }
     .hex-pair { padding:8px 4px; border:1px solid #294056; border-radius:7px; background:#03080d; text-align:center; }
     .hex-pair span { display:block; color:var(--muted); font:9px monospace; text-transform:uppercase; }
-    .hex-pair strong { display:block; margin-top:3px; color:var(--amber); font:700 22px monospace; letter-spacing:.08em; }
+    .hex-pair strong { display:block; margin-top:3px; color:var(--amber); font:700 18px monospace; letter-spacing:.04em; }
+    .hex-pair.disabled { opacity:.45; }
 
     .channel-picker { display:grid; grid-template-columns:repeat(3,1fr); gap:7px; margin-bottom:11px; }
     .channel-toggle { position:relative; margin:0; cursor:pointer; }

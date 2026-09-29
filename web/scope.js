@@ -9,8 +9,7 @@
     let fullScaleMv = 5000, measuredSampleCycles = 0, labeledSampleCycles = 0;
     const traces = Array.from({length:6},()=>({values:new Uint16Array(CAPACITY),lows:new Uint16Array(CAPACITY),highs:new Uint16Array(CAPACITY),times:new Float64Array(CAPACITY),head:0,count:0,latest:0}));
     let paused = false, drawNeeded = true;
-    let lastEventAt = 0, connected = false, currentChannel = 0;
-    let pendingChannel = null, pendingValue = null, pendingSince = 0;
+    let lastEventAt = 0, connected = false;
     let viewMode = "live", captureRecord = null, captureStatusTimer = 0;
     let captureViewport = {startSec: 0, endSec: 1};
     let captureCursorA = null, captureCursorB = null;
@@ -135,19 +134,23 @@
         min=Math.min(min,trace.lows[j]);max=Math.max(max,trace.highs[j]);
         sum+=value;sumSquares+=value*value;count++;samples.push({time,value});
       }
-      if(!count)return {count:0,min:null,max:null,peakToPeak:null,average:null,rms:null,frequencyHz:null};
-      const midpoint=(min+max)/2,hysteresis=Math.max(2,(max-min)*0.1);
+      if(!count)return {count:0,min:null,max:null,peakToPeak:null,average:null,rms:null,frequencyHz:null,periodMs:null,dutyPercent:null};
+      const peakToPeak=max-min;
+      if(samples.length<3||peakToPeak<Math.max(12,ADC_MAX*0.005))return {count,min,max,peakToPeak,average:sum/count,rms:Math.sqrt(sumSquares/count),frequencyHz:null,periodMs:null,dutyPercent:null};
+      const midpoint=(min+max)/2,hysteresis=Math.max(2,peakToPeak*0.1);
       const low=midpoint-hysteresis,high=midpoint+hysteresis,crossings=[];
-      let armed=false;
-      for(const sample of samples){
-        if(sample.value<=low)armed=true;
-        if(armed&&sample.value>=high){crossings.push(sample.time);armed=false;}
+      let highState=samples[0].value>=midpoint,highDuration=0,totalDuration=0;
+      for(let i=1;i<samples.length;i++){
+        const elapsed=samples[i].time-samples[i-1].time;
+        if(elapsed>0){totalDuration+=elapsed;if(highState)highDuration+=elapsed;}
+        if(highState&&samples[i].value<=low)highState=false;
+        else if(!highState&&samples[i].value>=high){highState=true;crossings.push(samples[i].time);}
       }
       const periods=[];
       for(let i=1;i<crossings.length;i++)if(crossings[i]>crossings[i-1])periods.push(crossings[i]-crossings[i-1]);
       periods.sort((a,b)=>a-b);
-      const periodMs=periods.length?periods[Math.floor(periods.length/2)]:0;
-      return {count,min,max,peakToPeak:max-min,average:sum/count,rms:Math.sqrt(sumSquares/count),frequencyHz:periodMs>0?1000/periodMs:null};
+      const periodMs=periods.length>=2?periods[Math.floor(periods.length/2)]:null;
+      return {count,min,max,peakToPeak,average:sum/count,rms:Math.sqrt(sumSquares/count),frequencyHz:periodMs?1000/periodMs:null,periodMs,dutyPercent:totalDuration>0?100*highDuration/totalDuration:null};
     }
 
     function analysisVoltage(value) { return value===null?"--":volts(value).toFixed(3)+" V"; }
@@ -159,7 +162,7 @@
         return `<tr class="${ch===focus?"focus":""}"><td><span class="channel-key" style="--channel:${TRACE_COLORS[ch]}">CH${ch}</span>${focusLabel}</td>`+
           `<td>${trace.count?analysisVoltage(trace.latest):"--"}</td><td>${analysisVoltage(measurement.min)}</td><td>${analysisVoltage(measurement.max)}</td>`+
           `<td>${analysisVoltage(measurement.peakToPeak)}</td><td>${analysisVoltage(measurement.average)}</td><td>${analysisVoltage(measurement.rms)}</td>`+
-          `<td>${measurement.frequencyHz?measurement.frequencyHz.toFixed(2)+" Hz":"--"}</td></tr>`;
+          `<td>${formatFrequencyHz(measurement.frequencyHz)}</td></tr>`;
       }).join("")||'<tr><td colspan="8">No channels enabled.</td></tr>';
     }
 
@@ -196,8 +199,8 @@
         const newest=channelTimes.length?Math.max(...channelTimes):performance.now();
         range={start:newest-windowMs,end:newest,triggered:false};
       }
-      let min=ADC_MAX, max=0, sum=0, visible=0;
-      for(let i=0;i<focusTrace.count;i++){const j=indexAt(focusTrace,i),t=focusTrace.times[j];if(t>=range.start&&t<=range.end){const v=focusTrace.values[j];if(focusTrace.lows[j]<min)min=focusTrace.lows[j];if(focusTrace.highs[j]>max)max=focusTrace.highs[j];sum+=v;visible++;}}
+      let min=ADC_MAX, max=0, visible=0;
+      for(let i=0;i<focusTrace.count;i++){const j=indexAt(focusTrace,i),t=focusTrace.times[j];if(t>=range.start&&t<=range.end){if(focusTrace.lows[j]<min)min=focusTrace.lows[j];if(focusTrace.highs[j]>max)max=focusTrace.highs[j];visible++;}}
       if (!visible) { min=0; max=ADC_MAX; }
       const scale=1<<Number($("vertical").value);
       const center=2048+(Number($("verticalPosition").value)-50)*32;
@@ -238,17 +241,13 @@
         }
       }
 
-      let sumSquares=0, above=0, crossings=[], priorIndex=-1;
-      const midpoint=(min+max)/2;
-      for(let i=0;i<focusTrace.count;i++){const j=indexAt(focusTrace,i),t=focusTrace.times[j];if(t<range.start||t>range.end)continue;const v=focusTrace.values[j];sumSquares+=v*v;if(v>=midpoint)above++;if(priorIndex>=0&&focusTrace.values[priorIndex]<midpoint&&v>=midpoint)crossings.push(t);priorIndex=j;}
-      let periodMs=0;if(crossings.length>=2)periodMs=(crossings[crossings.length-1]-crossings[0])/(crossings.length-1);
-      const avg=visible?sum/visible:0, rms=visible?Math.sqrt(sumSquares/visible):0;
-      $("minText").textContent=formatVolts(min);$("maxText").textContent=formatVolts(max);
-      $("ppText").textContent=(volts(max-min)).toFixed(3)+" V";$("avgText").textContent=formatVolts(avg);
-      $("rmsText").textContent=formatVolts(rms);
-      $("frequencyText").textContent=periodMs>0?(1000/periodMs).toFixed(2)+" Hz":"-- Hz";
-      $("periodText").textContent=periodMs>0?periodMs.toFixed(2)+" ms":"-- ms";
-      $("dutyText").textContent=visible&&max-min>8?(100*above/visible).toFixed(1)+" %":"-- %";
+      const measurement=analyzeLiveTrace(focusTrace,range);
+      $("minText").textContent=measurement.count?formatVolts(measurement.min):"--";$("maxText").textContent=measurement.count?formatVolts(measurement.max):"--";
+      $("ppText").textContent=measurement.count?volts(measurement.peakToPeak).toFixed(3)+" V":"--";$("avgText").textContent=measurement.count?formatVolts(measurement.average):"--";
+      $("rmsText").textContent=measurement.count?formatVolts(measurement.rms):"--";
+      $("frequencyText").textContent=formatFrequencyHz(measurement.frequencyHz);
+      $("periodText").textContent=measurement.periodMs?formatPeriodSeconds(measurement.periodMs/1000):"--";
+      $("dutyText").textContent=measurement.dutyPercent===null?"-- %":measurement.dutyPercent.toFixed(1)+" %";
       $("samplesText").textContent=String(traces.reduce((total,trace)=>total+trace.count,0));
       $("triggerText").textContent=triggerMode==="free"?"FREE":(!stabilize?"LIVE "+triggerMode.toUpperCase():(range.triggered?triggerMode.toUpperCase()+" LOCK":"WAITING "+triggerMode.toUpperCase()));
       renderLiveChannelAnalysis(range);
@@ -259,6 +258,18 @@ function formatCaptureRate(hz) {
       if (hz >= 1000000) return (hz / 1000000).toFixed(3) + " MS/s";
       if (hz >= 1000) return (hz / 1000).toFixed(3) + " kS/s";
       return hz.toFixed(2) + " S/s";
+    }
+
+    function formatFrequencyHz(hz) {
+      if (!(hz > 0)) return "-- Hz";
+      if (hz >= 1000000) return (hz / 1000000).toFixed(3) + " MHz";
+      if (hz >= 1000) return (hz / 1000).toFixed(3) + " kHz";
+      return hz.toFixed(hz < 10 ? 3 : 2) + " Hz";
+    }
+
+    function formatPeriodSeconds(seconds) {
+      if (!(seconds > 0)) return "--";
+      return formatAxisTime(seconds);
     }
 
     function formatCaptureDuration(seconds) {
@@ -316,28 +327,26 @@ function formatCaptureRate(hz) {
         return;
       }
       element.hidden = false;
-      const a = captureCursorA === null ? "--" : formatCaptureDuration(captureCursorA);
-      const b = captureCursorB === null ? "--" : formatCaptureDuration(captureCursorB);
+      const sampleA = captureCursorA === null ? null : nearestCaptureSample(captureRecord, captureCursorA);
+      const sampleB = captureCursorB === null ? null : nearestCaptureSample(captureRecord, captureCursorB);
+      const a = sampleA ? formatCaptureDuration(sampleA.timeSec) + " / " + formatCaptureVolts(sampleA.adc) : "--";
+      const b = sampleB ? formatCaptureDuration(sampleB.timeSec) + " / " + formatCaptureVolts(sampleB.adc) : "--";
       const delta = captureCursorA !== null && captureCursorB !== null
         ? Math.abs(captureCursorB - captureCursorA) : null;
-      const voltsDelta = measurement && measurement.valid && captureCursorA !== null && captureCursorB !== null
-        ? cursorVoltageDelta(captureRecord, captureCursorA, captureCursorB) : null;
+      const voltsDelta = measurement && measurement.valid && sampleA && sampleB
+        ? CaptureProtocol.valueToVolts(sampleB.adc-sampleA.adc,captureRecord.fullScaleMv) : null;
       element.textContent = delta === null
         ? "Cursor A " + a + " | Cursor B --"
-        : "A " + a + " | B " + b + " | dt " + formatCaptureDuration(delta) + " | dV " + (voltsDelta === null ? "--" : voltsDelta.toFixed(4) + " V");
+        : "A " + a + " | B " + b + " | dt " + formatCaptureDuration(delta) + " | 1/dt " + formatFrequencyHz(delta>0?1/delta:null) + " | dV " + (voltsDelta === null ? "--" : voltsDelta.toFixed(4) + " V");
     }
 
-    function cursorVoltageDelta(record, firstSec, secondSec) {
-      const nearest = (time) => {
-        let best = null, distance = Infinity;
-        for (const sample of record.validSamples) {
-          const d = Math.abs(sample.timeSec - time);
-          if (d < distance) { distance = d; best = sample; }
-        }
-        return best;
-      };
-      const a = nearest(firstSec), b = nearest(secondSec);
-      return a && b ? CaptureProtocol.valueToVolts(b.adc - a.adc, record.fullScaleMv) : null;
+    function nearestCaptureSample(record, time) {
+      let best = null, distance = Infinity;
+      for (const sample of record.validSamples) {
+        const nextDistance = Math.abs(sample.timeSec-time);
+        if(nextDistance<distance){distance=nextDistance;best=sample;}
+      }
+      return best;
     }
 
     function resetCaptureViewport() {
@@ -707,8 +716,8 @@ function formatCaptureRate(hz) {
       $("ppText").textContent = measurement.valid ? formatCaptureVolts(measurement.peakToPeak) : "--";
       $("avgText").textContent = measurement.valid ? formatCaptureVolts(measurement.average) : "--";
       $("rmsText").textContent = measurement.valid ? formatCaptureVolts(measurement.rms) : "--";
-      $("frequencyText").textContent = invalid(measurement.frequencyHz) ? "-- Hz" : measurement.frequencyHz.toFixed(3) + " Hz";
-      $("periodText").textContent = invalid(measurement.periodSec) ? "--" : (measurement.periodSec * 1000).toFixed(3) + " ms";
+      $("frequencyText").textContent = invalid(measurement.frequencyHz) ? "-- Hz" : formatFrequencyHz(measurement.frequencyHz);
+      $("periodText").textContent = invalid(measurement.periodSec) ? "--" : formatPeriodSeconds(measurement.periodSec);
       $("dutyText").textContent = invalid(measurement.dutyPercent) ? "-- %" : measurement.dutyPercent.toFixed(1) + " %";
       $("measurementSource").textContent = measurement.reason
         ? "Triggered Capture: FPGA timestamps; " + measurement.reason
@@ -829,12 +838,6 @@ function formatCaptureRate(hz) {
       const result = Math.max(0,Math.min(maximum,value)); element.value=result; return result;
     }
 
-    function updateCommandPreview() {
-      const ch=Math.max(0,Math.min(5,Math.round(Number($("channel").value)||0)));
-      const value=Math.max(0,Math.min(99,Math.round(Number($("value").value)||0)));
-      $("previewChannel").textContent=String(ch).padStart(2,"0");
-    }
-
     let settingsBusy=false, settingsAgain=false;
     async function applySettings() {
       if(settingsBusy){settingsAgain=true;return;}
@@ -843,13 +846,14 @@ function formatCaptureRate(hz) {
       do {
         settingsAgain=false;
         try {
-          const ch=clampInput($("channel"),5), value=clampInput($("value"),99);
+          const ch=clampInput($("channel"),5);
           const focusCheck=document.querySelector(`.channel-check[value="${ch}"]`);focusCheck.checked=true;
           const mask=channelMask(),selected=enabledChannels();
           status.className="command-status";status.textContent=`Starting ${selected.length}-channel acquisition...`;
-          const response=await fetch(`/api/channels?mask=${mask}&focus=${ch}&value=${value}`,{cache:"no-store"});
+          const response=await fetch(`/api/channels?mask=${mask}&focus=${ch}&value=0`,{cache:"no-store"});
           const text=await response.text(); if(!response.ok)throw new Error(text||`HTTP ${response.status}`);
-          pendingChannel=null;pendingValue=null;pendingSince=0;currentChannel=ch;$("channelTitle").textContent=selected.length>1?selected.join("/"):ch;clearSamples();
+          $("channelTitle").textContent=selected.length>1?selected.join("/"):ch;
+          $("enabledLive").textContent=selected.map(channel=>"CH"+channel).join("/");clearSamples();
           status.className="command-status good";status.textContent=`Comparing ${selected.map(channel=>"CH"+channel).join(", ")}; CH${ch} is the measurement focus.`;
 
         } catch(error) { status.className="command-status error";status.textContent=error.message; }
@@ -1012,7 +1016,7 @@ function formatCaptureRate(hz) {
     source.onerror=()=>{connected=false;setPill($("wifiPill"),"bad","Reconnecting...");};
     source.onmessage=event=>{
       try {
-        const d=JSON.parse(event.data);lastEventAt=performance.now();currentChannel=d.ch;
+        const d=JSON.parse(event.data);lastEventAt=performance.now();
         if(Number.isFinite(d.pc)&&d.pc>0){
           measuredSampleCycles=measuredSampleCycles?measuredSampleCycles*0.85+d.pc*0.15:d.pc;
           if(!labeledSampleCycles||Math.abs(measuredSampleCycles-labeledSampleCycles)>Math.max(2,labeledSampleCycles*0.005)){labeledSampleCycles=measuredSampleCycles;updateVgaTimeControl(false);}
@@ -1024,16 +1028,17 @@ function formatCaptureRate(hz) {
         $("baudText").textContent=d.baud.toLocaleString();$("footerBaud").textContent=d.baud.toLocaleString()+" baud";
         $("gen1Actual").textContent=formatGeneratorActual(1,d.g0hz,d.g0d,d.g0e);
         $("gen2Actual").textContent=formatGeneratorActual(2,d.g1hz,d.g1d,d.g1e);
-        $("valueLive").textContent=String(d.value).padStart(2,"0");$("channelLive").textContent=String(d.ch).padStart(2,"0");
+        $("channelLive").textContent="CH"+d.ch;
         const focus=Number($("channel").value),focusRaw=Array.isArray(d.av)?d.av[focus]:d.latest;
-        if(d.vm&(1<<focus)){$("voltageText").textContent=`CH${focus}  ${formatVolts(focusRaw)}`;$("rawText").textContent="ADC "+pad4(focusRaw);$("previewVoltage").textContent=volts(focusRaw).toFixed(3);}
+        if(d.vm&(1<<focus)){$("voltageText").textContent=`CH${focus}  ${formatVolts(focusRaw)}`;$("rawText").textContent="ADC "+pad4(focusRaw);}
+        if(Array.isArray(d.av))for(let ch=0;ch<3;ch++){
+          const active=Boolean(d.vm&(1<<ch)),pair=$("hexCh"+ch),readout=$("previewCh"+ch);
+          pair.classList.toggle("disabled",!active);
+          readout.textContent=active&&Number.isFinite(d.av[ch])?volts(d.av[ch]).toFixed(1)+" V":"--";
+        }
         // Do not overwrite the channel select here. Data arrives about every
         // 40 ms and used to force the control back before Apply could be tapped.
-        const selected=enabledChannels();$("channelTitle").textContent=selected.length>1?selected.join("/"):d.ch;
-        if(pendingChannel!==null && d.ch===pendingChannel && d.value===pendingValue){
-          pendingChannel=null;pendingValue=null;pendingSince=0;const status=$("commandStatus");status.className="command-status good";
-          status.textContent=`FPGA confirmed channel ${d.ch}, VALUE ${String(d.value).padStart(2,"0")}.`;
-        }
+        const selected=enabledChannels();$("channelTitle").textContent=selected.length>1?selected.join("/"):d.ch;$("enabledLive").textContent=selected.map(channel=>"CH"+channel).join("/");
         if(!paused&&d.fresh&&Array.isArray(d.sp)&&d.sp.length>=3){
           let batchDuration=0;for(let i=2;i<d.sp.length;i+=3)batchDuration+=d.sp[i]/1000;
           const now=performance.now(),predicted=phoneSampleClock+batchDuration;
@@ -1111,7 +1116,7 @@ function formatCaptureRate(hz) {
     $("applyButton").addEventListener("click",applySettings);
     $("autoButton").addEventListener("click",autoSetup);
     // The dropdown is the focus trace; checked channels are scanned and overlaid.
-    $("channel").addEventListener("change",()=>{updateCommandPreview();applySettings();});
+    $("channel").addEventListener("change",applySettings);
     document.querySelectorAll(".channel-check").forEach(input=>input.addEventListener("change",()=>{
       if(!channelMask()){input.checked=true;const status=$("commandStatus");status.className="command-status error";status.textContent="Keep at least one channel enabled.";return;}
       applySettings();
@@ -1143,10 +1148,7 @@ function formatCaptureRate(hz) {
     $("triggerLevel").addEventListener("change",applyDisplaySettings);
     $("verticalPosition").addEventListener("input",event=>{$("positionValue").textContent=event.target.value+"%";drawNeeded=true;});
     $("verticalPosition").addEventListener("change",applyDisplaySettings);
-    $("value").addEventListener("keydown",event=>{if(event.key==="Enter")applySettings();});
-    $("value").addEventListener("input",updateCommandPreview);
-    $("value").addEventListener("change",applySettings);
     window.addEventListener("resize",()=>drawNeeded=true);
-    setInterval(()=>{const now=performance.now(),age=lastEventAt?now-lastEventAt:Infinity;$("ageText").textContent=Number.isFinite(age)?Math.round(age)+" ms":"never";if(connected&&age>2000)setPill($("uartPill"),"bad","FPGA timeout");if(pendingSince&&now-pendingSince>2000){pendingSince=0;const status=$("commandStatus");status.className="command-status error";status.textContent="FPGA did not confirm the command. Check crossed TX/RX wiring, common ground, and the SW8 baud selection.";}},500);
-    updateCommandPreview();updateScaleLabels();updateVgaTimeControl(false);resizeCanvas();animationFrame();
+    setInterval(()=>{const now=performance.now(),age=lastEventAt?now-lastEventAt:Infinity;$("ageText").textContent=Number.isFinite(age)?Math.round(age)+" ms":"never";if(connected&&age>2000)setPill($("uartPill"),"bad","FPGA timeout");},500);
+    updateScaleLabels();updateVgaTimeControl(false);resizeCanvas();animationFrame();
   })();

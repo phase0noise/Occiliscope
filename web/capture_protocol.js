@@ -300,6 +300,10 @@
       result.valid = true;
       return result;
     }
+    if (result.peakToPeak < Math.max(12, ADC_MAX * 0.005)) {
+      result.reason = "Signal amplitude is too small for a reliable frequency estimate.";
+      return result;
+    }
     const midpoint = (result.min + result.max) / 2;
     const hysteresis = Math.max(2, (result.max - result.min) * 0.10);
     const lowThreshold = midpoint - hysteresis;

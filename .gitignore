@@ -12,13 +12,14 @@ simulation/work/
 simulation/control_work/
 simulation/questa/
 
-# Local validation builds. Keep the final Quartus programming files and reports,
-# but exclude the copied sources and temporary compiler database.
+# Local validation builds. Keep only the two files used to program the FPGA.
 build/*
 !build/quartus/
 build/quartus/*
 !build/quartus/output_files/
-!build/quartus/output_files/**
+build/quartus/output_files/*
+!build/quartus/output_files/oscilloscope.sof
+!build/quartus/output_files/oscilloscope.pof
 .sim_capture/
 
 # Local diagnostics and vendor/example dumps are not active project sources

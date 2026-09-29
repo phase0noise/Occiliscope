@@ -1,8 +1,9 @@
 # DE10-Lite oscilloscope
 
-Oscilloscope built with a DE10-Lite FPGA and a Raspberry Pi Pico W. The FPGA
-samples six ADC inputs, draws a 640x480 VGA display, and sends data over UART.
-The Pico W serves a browser view for live traces and triggered captures.
+A six-channel oscilloscope built around a DE10-Lite and a Raspberry Pi Pico W.
+The FPGA handles sampling, triggering, timestamped capture, and the 640x480 VGA
+display. The Pico W adds browser controls without putting acquisition timing in
+the browser.
 
 This is an experimental instrument. Check the ADC input range and any external
 front end before connecting a signal; the displayed voltage depends on the
@@ -68,9 +69,9 @@ timestamps; an 8,192-sample transfer takes at least 5.1 seconds at 115200 baud.
 | `simulation/` | Focused HDL and C++ test benches |
 
 The generated ADC synthesis files and `web_page.h` are checked in because the
-Quartus and Arduino builds consume them directly. The latest Quartus programming
-files and reports under `build/quartus/output_files/` are also versioned. Build
-databases, legacy output folders, and local editor files are ignored.
+Quartus and Arduino builds consume them directly. The latest `.sof` and `.pof`
+programming files are included under `build/quartus/output_files/`; reports,
+build databases, legacy output folders, and local editor files are ignored.
 
 See [UART control and telemetry](docs/UART_PROTOCOL.md),
 [capture format](docs/CAPTURE_PROTOCOL.md), and

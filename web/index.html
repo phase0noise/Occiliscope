@@ -126,14 +126,15 @@
 
 
         <section class="panel section">
-          <h2>FPGA Input</h2>
+          <h2>Channels</h2>
           <div class="live-data-grid compact-status">
-            <div class="live-data"><span>VALUE</span><strong id="valueLive">00</strong></div>
-            <div class="live-data"><span>Focus CH</span><strong id="channelLive">00</strong></div>
+            <div class="live-data"><span>Focus</span><strong id="channelLive">CH0</strong></div>
+            <div class="live-data"><span>Enabled</span><strong id="enabledLive">CH0</strong></div>
           </div>
-          <div class="hex-preview" title="Physical order: HEX5 on the left through HEX0 on the right">
-            <div class="hex-pair"><span>HEX5-4 channel</span><strong id="previewChannel">00</strong></div>
-            <div class="hex-pair"><span>HEX3-0 voltage</span><strong id="previewVoltage">0.000</strong></div>
+          <div class="hex-preview" title="The three voltage pairs shown on the DE10-Lite display">
+            <div id="hexCh0" class="hex-pair"><span>HEX5-4 / CH0</span><strong id="previewCh0">--</strong></div>
+            <div id="hexCh1" class="hex-pair"><span>HEX3-2 / CH1</span><strong id="previewCh1">--</strong></div>
+            <div id="hexCh2" class="hex-pair"><span>HEX1-0 / CH2</span><strong id="previewCh2">--</strong></div>
           </div>
           <div class="field"><label><span>Channels to display</span><b>select one or more</b></label>
             <div class="channel-picker">
@@ -148,9 +149,8 @@
           <div class="field"><label for="channel"><span>Focus channel</span><b>VGA + trigger</b></label>
             <select id="channel"><option value="0">CH0 / ADC_IN0</option><option value="1">CH1 / ADC_IN1</option><option value="2">CH2 / ADC_IN2</option><option value="3">CH3 / ADC_IN3</option><option value="4">CH4 / ADC_IN4</option><option value="5">CH5 / ADC_IN5</option></select>
           </div>
-          <div class="field"><label for="value"><span>VALUE</span><b>00-99</b></label><input id="value" type="number" min="0" max="99" value="0" inputmode="numeric"></div>
-          <button id="applyButton" class="primary" style="width:100%">Apply channels + VALUE</button>
-          <div id="commandStatus" class="command-status">Ready. Channel and VALUE are confirmed by FPGA telemetry.</div>
+          <button id="applyButton" class="primary" style="width:100%">Apply channel selection</button>
+          <div id="commandStatus" class="command-status">Choose the visible channels and the channel used for triggering and measurements.</div>
         </section>
 
         <section class="panel section">

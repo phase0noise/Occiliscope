@@ -76,6 +76,17 @@ test("suppresses timing measurements across a timestamp gap", () => {
   assert.match(measurement.reason, /gap/i);
 });
 
+test("does not report noise as a signal frequency", () => {
+  const ticks = Array.from({length: 128}, (_, index) => index * 1000);
+  const values = ticks.map((_, index) => 2048 + (index % 5) - 2);
+  const record = protocol.decodeCapture(fixture({ticks, values}), {clockHz: 1000000});
+  const measurement = protocol.measureRecord(record);
+  assert.equal(measurement.valid, true);
+  assert.equal(measurement.frequencyHz, null);
+  assert.equal(measurement.dutyPercent, null);
+  assert.match(measurement.reason, /amplitude/i);
+});
+
 test("marks inconsistent metadata invalid and rejects truncation", () => {
   const ticks = [1000, 2000, 3000];
   const badHeader = protocol.decodeCapture(fixture({ticks, firstTick: 999}), {clockHz: 1000000});
