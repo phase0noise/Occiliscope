@@ -1,0 +1,35 @@
+# Quartus generated databases and programming outputs
+db/
+incremental_db/
+output_files/
+
+# Quartus workspace state and automatic backups
+*.qws
+*.bak
+
+# Generated simulator work libraries and netlists
+simulation/work/
+simulation/control_work/
+simulation/questa/
+
+# Local validation builds. Keep the final Quartus programming files and reports,
+# but exclude the copied sources and temporary compiler database.
+build/*
+!build/quartus/
+build/quartus/*
+!build/quartus/output_files/
+!build/quartus/output_files/**
+.sim_capture/
+
+# Local diagnostics and vendor/example dumps are not active project sources
+*.log
+work/
+referance/
+
+# Editor-specific launch state
+.theia/
+
+# Retired coil-control design kept locally for reference
+/fire.vhd
+/position_control.vhd
+/simulation/position_control_tb.vhd

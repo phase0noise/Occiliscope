@@ -1,0 +1,17 @@
+* text=auto
+*.v text eol=lf
+*.vhd text eol=lf
+*.sdc text eol=lf
+*.qsf text eol=lf
+*.qpf text eol=lf
+*.js text eol=lf
+*.css text eol=lf
+*.html text eol=lf
+*.md text eol=lf
+*.ps1 text eol=crlf
+*.qsys text eol=lf
+*.sopcinfo text eol=lf
+*.sof binary
+*.pof binary
+*.cdb binary
+*.hdb binary

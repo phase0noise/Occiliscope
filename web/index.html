@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#07101a">
+  <meta name="description" content="A six-channel FPGA oscilloscope interface for the Terasic DE10-Lite and Raspberry Pi Pico W.">
+  <title>FPGA Oscilloscope</title>
+  <link rel="stylesheet" href="scope.css">
+
+</head>
+<body>
+  <main class="shell">
+    <header>
+      <div class="brand">
+        <div class="mark"></div>
+        <div><div class="eyebrow">DE10-Lite + Pico W</div><h1>FPGA Oscilloscope</h1></div>
+      </div>
+      <div class="status-row">
+        <div id="wifiPill" class="pill" role="status" aria-live="polite"><i class="dot"></i><span>Connecting to Pico W</span></div>
+        <div id="uartPill" class="pill"><i class="dot"></i><span>Waiting for FPGA</span></div>
+        <div class="pill"><span id="rateText">0 pkt/s</span></div>
+      </div>
+    </header>
+
+    <div class="layout">
+      <section class="panel scope-panel">
+        <div class="scope-toolbar">
+          <div class="scope-title"><span id="runBadge" class="run-badge">RUN</span><span>CH<span id="channelTitle">0</span></span></div>
+          <div id="viewMode" class="mode-switch" role="tablist" aria-label="Oscilloscope view">
+            <button id="liveModeButton" class="mode-button active" role="tab" aria-selected="true">Live Monitor</button>
+            <button id="captureModeButton" class="mode-button" role="tab" aria-selected="false">Triggered Capture</button>
+          </div>
+          <div class="toolbar-controls">
+            <label class="toolbar-field vga-scale-field" for="timebase"><span>VGA TIME SCALE <b id="vgaTimebaseValue">X1</b></span>
+              <input id="timebase" class="scale-slider" type="range" min="0" max="10" step="1" value="0" aria-describedby="vgaWindowActual">
+              <span class="slider-ends" aria-hidden="true"><small>Faster</small><small>Slower</small></span>
+              <small id="vgaWindowActual">Waiting for FPGA timing...</small>
+            </label>
+            <label class="toolbar-field"><span>PHONE WINDOW</span><select id="browserWindow" class="compact" title="Total time across all ten phone divisions">
+              <option value="0">10 ms total (1 ms/div)</option><option value="1">25 ms total (2.5 ms/div)</option>
+              <option value="2">50 ms total (5 ms/div)</option><option value="3">100 ms total (10 ms/div)</option>
+              <option value="4" selected>250 ms total (25 ms/div)</option><option value="5">500 ms total (50 ms/div)</option>
+              <option value="6">1 s total (100 ms/div)</option>
+            </select></label>
+            <label class="toolbar-field voltage-scale-field" for="vertical"><span>VGA VOLTS / DIV <b id="verticalScaleValue">625 mV/div</b></span>
+              <input id="vertical" class="scale-slider" type="range" min="0" max="3" step="1" value="0">
+              <span class="slider-ends" aria-hidden="true"><small>1X</small><small>8X</small></span>
+            </label>
+            <label class="toolbar-field"><span>TRIGGER</span><select id="triggerMode" class="compact" title="Trigger mode">
+              <option value="free">Free run</option><option value="auto" selected>Auto trigger</option><option value="rising">Rising trigger</option>
+              <option value="falling">Falling trigger</option>
+            </select></label>
+            <button id="autoButton" class="primary">Auto setup</button><button id="pauseButton">Pause</button><button id="clearButton">Clear</button><button id="saveImageButton" title="Save or share the current scope view">Save image</button>
+          </div>
+        </div>
+        <div class="canvas-wrap">
+          <canvas id="scope" role="img" aria-label="Oscilloscope waveform display"></canvas>
+          <div class="readout"><span id="voltageText">0.000 V</span><small id="rawText">ADC 0000</small></div>
+          <div id="triggerText" class="trigger-label">AUTO</div>
+          <div id="captureCursorReadout" class="capture-cursor-readout" hidden></div>
+          <div id="xAxisReadout" class="x-axis-readout">250 ms window · 25 ms/div</div>
+          <div id="traceLegend" class="trace-legend"></div>
+        </div>
+        <div class="measurements">
+          <div class="measurement"><span>Minimum</span><strong id="minText">0.000 V</strong></div>
+          <div class="measurement"><span>Maximum</span><strong id="maxText">0.000 V</strong></div>
+          <div class="measurement"><span>Peak-Peak</span><strong id="ppText">0.000 V</strong></div>
+          <div class="measurement"><span>Average</span><strong id="avgText">0.000 V</strong></div>
+          <div class="measurement"><span>RMS</span><strong id="rmsText">0.000 V</strong></div>
+          <div class="measurement"><span>Frequency</span><strong id="frequencyText">-- Hz</strong></div>
+          <div class="measurement"><span>Period</span><strong id="periodText">-- ms</strong></div>
+          <div class="measurement"><span>Duty</span><strong id="dutyText">-- %</strong></div>
+        </div>
+        <div id="measurementSource" class="measurement-source">Live Monitor: voltage and timing are transport-timed estimates from Pico telemetry.</div>
+        <section class="channel-analysis" aria-labelledby="channelAnalysisTitle">
+          <div class="channel-analysis-heading"><h2 id="channelAnalysisTitle">Channel comparison</h2><span>Visible plot window</span></div>
+          <div class="analysis-scroll">
+            <table>
+              <thead><tr><th>Channel</th><th>Now</th><th>Min</th><th>Max</th><th>P-P</th><th>Average</th><th>RMS</th><th>Frequency</th></tr></thead>
+              <tbody id="channelAnalysisBody"><tr><td colspan="8">Waiting for samples...</td></tr></tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+
+      <aside>
+        <section class="panel section capture-panel">
+          <h2>FPGA Capture</h2>
+          <p id="captureStatus" class="command-status">Idle</p>
+          <div class="button-row capture-actions">
+            <button id="armCaptureButton" class="primary">Arm capture</button>
+            <button id="stopCaptureButton" class="danger">Stop</button>
+            <button id="downloadCaptureButton" class="wide">Download record</button>
+            <button id="manualSnapshotButton" class="wide">Take VGA snapshot</button>
+          </div>
+          <div class="button-row">
+            <button id="exportCaptureButton">Export capture CSV</button>
+            <button id="resetCaptureViewButton">Reset zoom</button>
+          </div>
+          <div class="button-row capture-zoom-actions">
+            <button id="captureZoomInButton" aria-label="Zoom into capture">Zoom in</button>
+            <button id="captureZoomOutButton" aria-label="Zoom out of capture">Zoom out</button>
+          </div>
+          <div class="field snapshot-controls">
+            <label for="autoSnapshot"><span>Auto VGA snapshots</span><b>ON/OFF</b></label>
+            <input id="autoSnapshot" type="checkbox">
+          </div>
+          <div class="field"><label for="snapshotInterval"><span>Snapshot refresh</span><b>UART-limited</b></label>
+            <select id="snapshotInterval"><option value="750" selected>Fastest</option><option value="5000">5 s pause</option><option value="15000">15 s pause</option></select>
+          </div>
+          <p id="snapshotStatus" class="muted">Off</p>
+          <dl class="diag capture-meta">
+            <dt>State</dt><dd id="captureStateText">idle</dd>
+            <dt>Records</dt><dd id="captureRecordText">--</dd>
+            <dt>Sample rate</dt><dd id="captureRateText">--</dd>
+            <dt>Duration</dt><dd id="captureDurationText">--</dd>
+            <dt>Trigger</dt><dd id="captureTriggerText">--</dd>
+            <dt>Trigger setup</dt><dd id="captureTriggerSetupText">--</dd>
+            <dt>Averaging</dt><dd id="captureAverageText">--</dd>
+            <dt>Config ID</dt><dd id="captureConfigText">--</dd>
+            <dt>Quality</dt><dd id="captureQualityText">--</dd>
+          </dl>
+          <p id="captureHelp" class="muted">Snapshots match the FPGA VGA timebase and 576-point plot. Wheel: zoom. Drag: pan. Tap: cursor.</p>
+        </section>
+
+
+        <section class="panel section">
+          <h2>FPGA Input</h2>
+          <div class="live-data-grid compact-status">
+            <div class="live-data"><span>VALUE</span><strong id="valueLive">00</strong></div>
+            <div class="live-data"><span>Focus CH</span><strong id="channelLive">00</strong></div>
+          </div>
+          <div class="hex-preview" title="Physical order: HEX5 on the left through HEX0 on the right">
+            <div class="hex-pair"><span>HEX5-4 channel</span><strong id="previewChannel">00</strong></div>
+            <div class="hex-pair"><span>HEX3-0 voltage</span><strong id="previewVoltage">0.000</strong></div>
+          </div>
+          <div class="field"><label><span>Channels to display</span><b>select one or more</b></label>
+            <div class="channel-picker">
+              <label class="channel-toggle" style="--ch:#53efff"><input class="channel-check" type="checkbox" value="0" checked><span>CH0</span></label>
+              <label class="channel-toggle" style="--ch:#ffd166"><input class="channel-check" type="checkbox" value="1"><span>CH1</span></label>
+              <label class="channel-toggle" style="--ch:#70e000"><input class="channel-check" type="checkbox" value="2"><span>CH2</span></label>
+              <label class="channel-toggle" style="--ch:#ff70a6"><input class="channel-check" type="checkbox" value="3"><span>CH3</span></label>
+              <label class="channel-toggle" style="--ch:#9b8cff"><input class="channel-check" type="checkbox" value="4"><span>CH4</span></label>
+              <label class="channel-toggle" style="--ch:#ff8c42"><input class="channel-check" type="checkbox" value="5"><span>CH5</span></label>
+            </div>
+          </div>
+          <div class="field"><label for="channel"><span>Focus channel</span><b>VGA + trigger</b></label>
+            <select id="channel"><option value="0">CH0 / ADC_IN0</option><option value="1">CH1 / ADC_IN1</option><option value="2">CH2 / ADC_IN2</option><option value="3">CH3 / ADC_IN3</option><option value="4">CH4 / ADC_IN4</option><option value="5">CH5 / ADC_IN5</option></select>
+          </div>
+          <div class="field"><label for="value"><span>VALUE</span><b>00-99</b></label><input id="value" type="number" min="0" max="99" value="0" inputmode="numeric"></div>
+          <button id="applyButton" class="primary" style="width:100%">Apply channels + VALUE</button>
+          <div id="commandStatus" class="command-status">Ready. Channel and VALUE are confirmed by FPGA telemetry.</div>
+        </section>
+
+        <section class="panel section">
+          <h2>VGA Acquisition</h2>
+          <div class="field"><label for="fullScaleMv"><span>ADC full scale</span><b>calibration</b></label><input id="fullScaleMv" type="number" min="1000" max="9999" value="5000" inputmode="numeric"></div>
+          <button id="calibrateButton" style="width:100%;margin-bottom:10px">Apply voltage calibration</button>
+          <div class="field"><label for="triggerLevel"><span>Trigger level</span><b id="triggerValue">2.500 V</b></label><input id="triggerLevel" type="range" min="0" max="4095" value="2048"></div>
+          <div class="field"><label for="verticalPosition"><span>Vertical position</span><b id="positionValue">50%</b></label><input id="verticalPosition" type="range" min="0" max="100" value="50"></div>
+          <div class="field"><label for="triggerPosition"><span>Pre-trigger position</span><b>history</b></label><select id="triggerPosition"><option value="0">10%</option><option value="1" selected>25%</option><option value="2">50%</option><option value="3">75%</option></select></div>
+          <div class="field"><label for="acquisitionAverage"><span>Acquisition bandwidth</span><b>speed / noise</b></label><select id="acquisitionAverage"><option value="0" selected>Maximum speed - no averaging</option><option value="1">4 samples - light filtering</option><option value="2">16 samples - low noise</option><option value="3">64 samples - strongest filtering</option></select></div>
+          <div class="field"><label for="stabilizeWave"><span>Wave stabilization</span><b>adaptive trigger + short hold</b></label><input id="stabilizeWave" type="checkbox"></div>
+          <div class="field"><label for="singleShot"><span>Single-shot capture</span><b>ON/OFF</b></label><input id="singleShot" type="checkbox"></div>
+          <div class="field"><label for="gridEnable"><span>VGA graticule</span><b>ON/OFF</b></label><input id="gridEnable" type="checkbox" checked></div>
+          <div class="button-row"><button id="rearmButton">Re-arm capture</button><button id="exportButton">Export CSV</button><button id="resetViewButton" class="wide">Reset view</button></div>
+        </section>
+
+        <section class="panel section">
+          <h2>GPIO Signal Generators</h2>
+          <p class="muted">3.3 V outputs; use a common ground.</p>
+          <div class="field"><label for="gen1Frequency"><span>Generator 1 · GPIO[28]</span><b>1 Hz–2 MHz</b></label><span class="frequency-entry"><input id="gen1Frequency" type="number" min="0.001" step="any" value="1" inputmode="decimal"><select id="gen1Unit" aria-label="Generator 1 frequency unit"><option value="Hz">Hz</option><option value="kHz" selected>kHz</option><option value="MHz">MHz</option></select></span></div>
+          <div class="field"><label for="gen1Duty"><span>GPIO[28] duty cycle</span><b id="gen1DutyValue">50%</b></label><input id="gen1Duty" type="range" min="0" max="100" value="50"></div>
+          <div class="field"><label for="gen1Enable"><span>GPIO[28] output</span><b>ON/OFF</b></label><input id="gen1Enable" type="checkbox"></div>
+          <button id="gen1Apply" style="width:100%;margin-bottom:12px">Apply GPIO[28]</button>
+          <p class="muted" id="gen1Actual">GPIO[28] is OFF</p>
+          <div class="field"><label for="gen2Frequency"><span>Generator 2 · GPIO[30]</span><b>1 Hz–2 MHz</b></label><span class="frequency-entry"><input id="gen2Frequency" type="number" min="0.001" step="any" value="1" inputmode="decimal"><select id="gen2Unit" aria-label="Generator 2 frequency unit"><option value="Hz">Hz</option><option value="kHz" selected>kHz</option><option value="MHz">MHz</option></select></span></div>
+          <div class="field"><label for="gen2Duty"><span>GPIO[30] duty cycle</span><b id="gen2DutyValue">50%</b></label><input id="gen2Duty" type="range" min="0" max="100" value="50"></div>
+          <div class="field"><label for="gen2Enable"><span>GPIO[30] output</span><b>ON/OFF</b></label><input id="gen2Enable" type="checkbox"></div>
+          <button id="gen2Apply" style="width:100%">Apply GPIO[30]</button>
+          <p class="muted" id="gen2Actual">GPIO[30] is OFF</p>
+        </section>
+
+        <section class="panel section">
+          <h2>Diagnostics</h2>
+          <dl class="diag">
+            <dt>Packets</dt><dd id="packetsText">0</dd>
+            <dt>FPGA commands</dt><dd id="commandsText">0</dd>
+            <dt>UART errors</dt><dd id="errorsText">0</dd>
+            <dt>FPGA baud</dt><dd id="baudText">searching</dd>
+            <dt>Browser samples</dt><dd id="samplesText">0</dd>
+            <dt>Pico uptime</dt><dd id="uptimeText">0 s</dd>
+            <dt>Last update</dt><dd id="ageText">never</dd>
+          </dl>
+        </section>
+      </aside>
+    </div>
+    <nav class="mobile-actions" aria-label="Quick scope actions">
+      <button id="mobileRunButton">Pause</button>
+      <button id="mobileAutoButton" class="primary">Auto</button>
+      <button id="mobileSnapshotButton">FPGA snap</button>
+      <button id="mobileImageButton">Save image</button>
+    </nav>
+    <footer><span id="footerBaud">Auto 115200 / 9600 baud</span> 8N1 | SW8 selects FPGA speed | calibrated 12-bit ADC</footer>
+  </main>
+
+  <script src="capture_protocol.js"></script>
+  <script src="scope.js"></script>
+
+</body>
+</html>

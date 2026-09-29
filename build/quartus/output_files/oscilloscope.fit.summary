@@ -1,0 +1,18 @@
+Fitter Status : Successful - Tue Sep 22 23:26:23 2026
+Quartus Prime Version : 23.1std.1 Build 993 05/14/2024 SC Lite Edition
+Revision Name : oscilloscope
+Top-level Entity Name : oscilloscope
+Family : MAX 10
+Device : 10M50DAF484C7G
+Timing Models : Final
+Total logic elements : 16,009 / 49,760 ( 32 % )
+    Total combinational functions : 15,327 / 49,760 ( 31 % )
+    Dedicated logic registers : 4,439 / 49,760 ( 9 % )
+Total registers : 4439
+Total pins : 81 / 360 ( 23 % )
+Total virtual pins : 0
+Total memory bits : 888,832 / 1,677,312 ( 53 % )
+Embedded Multiplier 9-bit elements : 167 / 288 ( 58 % )
+Total PLLs : 1 / 4 ( 25 % )
+UFM blocks : 0 / 1 ( 0 % )
+ADC blocks : 1 / 2 ( 50 % )

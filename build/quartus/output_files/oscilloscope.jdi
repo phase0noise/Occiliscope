@@ -1,0 +1,16 @@
+<sld_project_info>
+  <project>
+    <hash md5_digest_80b="1465b3f9a1e9fb196467"/>
+  </project>
+  <file_info>
+    <file device="10M50DAF484C7G" path="oscilloscope.sof" usercode="0xFFFFFFFF"/>
+  </file_info>
+  <sld_infos>
+    <sld_info hpath="slide_adc:adc_core|adc_qsys:adc_ip" name="adc_ip">
+      <assignment_values>
+        <assignment_value text="QSYS_NAME adc_qsys HAS_SOPCINFO 1 GENERATION_ID 1658901566"/>
+      </assignment_values>
+      <parameters/>
+    </sld_info>
+  </sld_infos>
+</sld_project_info>
