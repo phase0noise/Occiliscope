@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "capture_protocol.h"
+#include "fft_protocol.h"
 
 #if __has_include(<hardware/watchdog.h>)
 #include <hardware/watchdog.h>
@@ -12,9 +13,7 @@
 #define HAS_RP2040_WATCHDOG 0
 #endif
 
-// ============================================================
 // Configuration
-// ============================================================
 
 constexpr char WIFI_NAME[] = "PicoScope";
 constexpr char WIFI_PASSWORD[] = "picoscope";
@@ -22,21 +21,15 @@ constexpr char WIFI_PASSWORD[] = "picoscope";
 constexpr uint8_t FPGA_UART_TX_PIN = 0;  // Pico GP0 -> FPGA GPIO[8]
 constexpr uint8_t FPGA_UART_RX_PIN = 1;  // Pico GP1 <- FPGA GPIO[4]
 constexpr uint32_t GENERATOR_MAX_HZ = 2000000;
-constexpr uint32_t FPGA_UART_BAUD_HIGH = 115200;
-constexpr uint32_t FPGA_UART_BAUD_LOW = 9600;
-constexpr uint32_t UART_BAUD_SCAN_MS = 700;
+constexpr uint32_t FPGA_UART_BAUD = 115200;
 
 constexpr uint16_t ADC_MAX_COUNT = 4095;
 constexpr float ADC_FULL_SCALE_VOLTS = 5.0f;
 constexpr uint8_t ADC_CHANNEL_COUNT = 6;
 
-// Deliver up to 100 phone samples/s at 115200 baud for a responsive trace.
-// At 9600 baud the newest available FPGA sample is repeated between packets.
-constexpr uint32_t SSE_INTERVAL_MS = 10;
-constexpr uint8_t RAW_SAMPLE_QUEUE_SIZE = 96;
-constexpr uint8_t RAW_SAMPLES_PER_EVENT = 24;
-constexpr uint32_t SSE_KEEPALIVE_MS = 5000;
-constexpr uint32_t SSE_STALL_TIMEOUT_MS = 2000;
+// Status needs fewer updates than waveforms. Keep Wi-Fi capacity for live data.
+constexpr uint32_t SSE_INTERVAL_MS = 100;
+constexpr uint32_t SSE_STALL_TIMEOUT_MS = 6000;
 
 constexpr uint32_t HTTP_READ_TIMEOUT_MS = 1200;
 constexpr uint32_t HTTP_WRITE_TIMEOUT_MS = 3000;
@@ -63,9 +56,7 @@ constexpr uint16_t CAPTURE_ARTIFACT_BYTES = OcciliCapture::ARTIFACT_BYTES;
 // stall a sketch when no serial monitor is consuming the USB buffer.
 #define DEBUG_UART_ECHO 0
 
-// ============================================================
 // Fixed-size runtime state
-// ============================================================
 
 WiFiServer webServer(80);
 WiFiClient eventClient;
@@ -101,9 +92,6 @@ uint32_t packetRateWindowStart = 0;
 uint32_t packetRateWindowCount = 0;
 
 uint32_t commandsSent = 0;
-uint32_t activeFpgaBaud = FPGA_UART_BAUD_HIGH;
-uint32_t lastBaudSwitchMillis = 0;
-bool fpgaBaudLocked = false;
 
 bool wifiReady = false;
 bool webServerStarted = false;
@@ -138,6 +126,7 @@ char captureStatusBody[HTTP_RESPONSE_SIZE] = {};
 
 char sseMessage[1600] = {};
 size_t sseMessageLength = 0;
+size_t sseMessageOffset = 0;
 uint32_t lastSseSendMillis = 0;
 uint32_t lastSseProgressMillis = 0;
 uint32_t sseDisconnectCount = 0;
@@ -166,19 +155,93 @@ struct ChannelBucket {
 
 ChannelBucket channelBuckets[ADC_CHANNEL_COUNT] = {};
 
-struct RawPhoneSample {
-  uint16_t adc;
-  uint16_t deltaUs;
-  uint8_t channel;
-};
+// UART arrival samples alias fast signals. Receive a held VGA window instead.
+// HTTP reads one buffer while the next frame fills the other.
+constexpr size_t LIVE_FRAME_MAX_BYTES = 34 + 288 * 37;
+uint8_t liveFrames[2][LIVE_FRAME_MAX_BYTES] = {};
+uint16_t liveLengths[2] = {};
+uint8_t liveReady = 0, liveReceiving = 1;
+uint16_t liveIndex = 0, liveExpected = 0, liveCrc = 0xffff;
+bool liveRequested = false;
+uint32_t liveRequestMillis = 0, liveByteMillis = 0;
+uint32_t liveClientMillis = 0;
 
-RawPhoneSample rawSampleQueue[RAW_SAMPLE_QUEUE_SIZE] = {};
-uint8_t rawSampleHead = 0;
-uint8_t rawSampleTail = 0;
-uint8_t rawSampleCount = 0;
-uint32_t previousRawSampleMicros = 0;
-bool rawSampleClockValid = false;
-uint32_t rawSampleDropped = 0;
+uint16_t liveCrcByte(uint16_t crc, uint8_t byte) {
+  crc ^= static_cast<uint16_t>(byte) << 8;
+  for (uint8_t bit = 0; bit < 8; ++bit)
+    crc = (crc & 0x8000U) ? (crc << 1) ^ 0x1021U : crc << 1;
+  return crc;
+}
+
+void acceptLiveByte(uint8_t byte) {
+  uint8_t* frame = liveFrames[liveReceiving];
+  frame[liveIndex++] = byte;
+  liveByteMillis = millis();
+  if (liveIndex <= 4 || liveIndex <= liveExpected - 2) liveCrc = liveCrcByte(liveCrc, byte);
+  if (liveIndex == 4) {
+    liveExpected = frame[2] | (static_cast<uint16_t>(frame[3]) << 8);
+    if (frame[1] != 1 || liveExpected < 34 || liveExpected > LIVE_FRAME_MAX_BYTES) {
+      liveIndex = 0; liveRequested = false; return;
+    }
+  }
+  if (liveExpected && liveIndex == liveExpected) {
+    const uint16_t receivedCrc = frame[liveExpected-2] |
+        (static_cast<uint16_t>(frame[liveExpected-1]) << 8);
+    uint8_t channels = 0;
+    for (uint8_t ch=0; ch<6; ++ch) if (frame[4] & (1U << ch)) ++channels;
+    if (receivedCrc == liveCrc && channels && frame[4] < 64 && frame[5] < 6 &&
+        (frame[4] & (1U << frame[5])) && frame[6] <= 10 && frame[7] <= 3 &&
+        frame[8] <= 100 && frame[9] <= 3 && frame[10] <= 3 &&
+        frame[18] == 0x20 && frame[19] == 1 &&
+        liveExpected == 34 + 288 * (1 + 6 * channels)) {
+      liveLengths[liveReceiving] = liveExpected;
+      liveReady = liveReceiving;
+      telemetry.lastPacketMillis = millis();
+      telemetry.valid = true;
+    } else telemetry.invalidLineCount++;
+    liveIndex = 0; liveRequested = false;
+  }
+}
+
+// One checked FFT artifact stays immutable until the next explicit request.
+enum FftState : uint8_t { FFT_IDLE, FFT_RUNNING, FFT_READY, FFT_ERROR, FFT_CANCELLED };
+FftState fftState=FFT_IDLE;
+OcciliFft::FrameParser fftParser;
+uint8_t fftArtifact[OcciliFft::FRAME_BYTES]={};
+uint16_t fftRequestId=0;
+uint32_t fftStartedMillis=0, fftTimeoutMs=0, fftLastByteMillis=0, fftDrainMillis=0;
+bool fftDraining=false;
+const char* fftError="";
+void acceptFftFrame(const uint8_t* frame) {
+  if(!frame) {
+    telemetry.invalidLineCount++;
+    if(fftState==FFT_RUNNING){fftState=FFT_ERROR;fftError="FFT checksum or packet failed. Capture again.";}
+    return;
+  }
+  if(OcciliCapture::readU32LE(frame+8)!=fftRequestId)return;
+  fftDraining=false;
+  if(fftState!=FFT_RUNNING)return;
+  if(frame[4]!=1) {
+    fftState=frame[4]==16?FFT_CANCELLED:FFT_ERROR;
+    fftError=frame[4]==2 ? "Acquisition settings changed during FFT. Capture again."
+      : frame[4]==4 ? "FFT samples were not evenly spaced. Capture again."
+      : frame[4]==8 ? "No FPGA samples arrived. Check the signal acquisition."
+      : "FFT cancelled.";
+    return;
+  }
+  memcpy(fftArtifact,frame,sizeof(fftArtifact));fftState=FFT_READY;
+  telemetry.lastPacketMillis=millis();telemetry.valid=true;
+}
+void serviceFftProtocol() {
+  const uint32_t now=millis();
+  if(fftParser.active() && now-fftLastByteMillis>250){fftParser.clear();acceptFftFrame(nullptr);}
+  if(fftState==FFT_RUNNING && now-fftStartedMillis>fftTimeoutMs) {
+    Serial1.write(static_cast<uint8_t>(0xad));
+    fftState=FFT_ERROR;fftError="FFT timed out. Rebuild/program the FPGA with FFT support.";
+    fftDraining=true;fftDrainMillis=now;
+  }
+  if(fftDraining && now-fftDrainMillis>2000)fftDraining=false;
+}
 
 // The frozen capture is kept in one bounded artifact buffer.  Keeping the
 // header and records together means HTTP can stream it directly without a
@@ -216,6 +279,8 @@ uint8_t captureTriggerMode = 0;
 uint16_t captureTriggerLevel = 0;
 uint8_t captureRawFlags = 0;
 uint8_t captureFlags = 0;
+uint8_t captureFormatVersion = OcciliCapture::FRAME_VERSION;
+uint16_t captureRecordBytes = OcciliCapture::RECORD_BYTES;
 uint32_t captureWireFrames = 0;
 uint32_t captureWireCrcErrors = 0;
 uint32_t captureWireSequenceErrors = 0;
@@ -255,15 +320,11 @@ bool configureGenerator(uint8_t index, uint32_t frequencyHz,
   return true;
 }
 
-// ============================================================
 // Browser application
-// ============================================================
 
 #include "web_page.h"
 
-// ============================================================
 // Utility helpers
-// ============================================================
 
 bool timeReached(uint32_t now, uint32_t target) {
   return static_cast<int32_t>(now - target) >= 0;
@@ -317,7 +378,10 @@ bool readQueryValue32(const char* request, const char* key, uint32_t maximum, ui
         if (*digit < '0' || *digit > '9') {
           return false;
         }
-        parsed = parsed * 10UL + static_cast<uint32_t>(*digit - '0');
+        const uint32_t nextDigit = static_cast<uint32_t>(*digit - '0');
+        if (parsed > maximum / 10UL ||
+            (parsed == maximum / 10UL && nextDigit > maximum % 10UL)) return false;
+        parsed = parsed * 10UL + nextDigit;
         if (parsed > maximum) {
           return false;
         }
@@ -337,9 +401,7 @@ bool readQueryValue(const char* request, const char* key, uint16_t maximum, uint
   return true;
 }
 
-// ============================================================
 // UART receive and command queue
-// ============================================================
 
 void acceptFpgaSample(uint16_t value,uint8_t confirmedChannel,uint16_t adc,
                       uint32_t samplePeriodCycles) {
@@ -347,7 +409,7 @@ void acceptFpgaSample(uint16_t value,uint8_t confirmedChannel,uint16_t adc,
   telemetry.adcLatest=adc;
   if(samplePeriodCycles>0)telemetry.samplePeriodCycles=samplePeriodCycles;
   telemetry.packetCount++;telemetry.lastPacketMillis=millis();telemetry.valid=true;
-  fpgaBaudLocked=true;packetRateWindowCount++;
+  packetRateWindowCount++;
 
   const uint32_t now=millis();
   if(now-lastTelemetryDebugMillis>=1000){
@@ -364,16 +426,6 @@ void acceptFpgaSample(uint16_t value,uint8_t confirmedChannel,uint16_t adc,
   else{bucket.sum=adc;bucket.count=1;bucket.low=adc;bucket.high=adc;}
   bucket.latest=adc;bucket.valid=true;
 
-  const uint32_t sampleMicros=micros();
-  const uint32_t elapsedUs=rawSampleClockValid?sampleMicros-previousRawSampleMicros:0;
-  previousRawSampleMicros=sampleMicros;rawSampleClockValid=true;
-  if(rawSampleCount==RAW_SAMPLE_QUEUE_SIZE){
-    rawSampleTail=static_cast<uint8_t>((rawSampleTail+1U)%RAW_SAMPLE_QUEUE_SIZE);
-    rawSampleCount--;
-    rawSampleDropped++;
-  }
-  rawSampleQueue[rawSampleHead]={adc,static_cast<uint16_t>(elapsedUs>65535U?65535U:elapsedUs),confirmedChannel};
-  rawSampleHead=static_cast<uint8_t>((rawSampleHead+1U)%RAW_SAMPLE_QUEUE_SIZE);rawSampleCount++;
 }
 
 void parseFpgaLine(const char* line, size_t length) {
@@ -410,12 +462,12 @@ static const char* captureStateName() {
 void writeCaptureArtifactHeader() {
   uint8_t* header = captureArtifact;
   header[0] = 'O'; header[1] = 'C'; header[2] = 'A'; header[3] = 'P';
-  header[4] = 1;
+  header[4] = captureFormatVersion;
   header[5] = static_cast<uint8_t>(OcciliCapture::ARTIFACT_HEADER_BYTES);
   header[6] = captureFlags;
   header[7] = static_cast<uint8_t>(captureFocusChannel);
   OcciliCapture::writeU16LE(header + 8, captureReceivedRecords);
-  OcciliCapture::writeU16LE(header + 10, OcciliCapture::RECORD_BYTES);
+  OcciliCapture::writeU16LE(header + 10, captureRecordBytes);
   OcciliCapture::writeU32LE(header + 12, captureSamplePeriod);
   OcciliCapture::writeU32LE(header + 16, captureCaptureId);
   OcciliCapture::writeU32LE(header + 20, captureTriggerIndex);
@@ -452,6 +504,10 @@ void rejectCapture(const char* reason) {
 
 void acceptCapturePacket(const uint8_t* packet, void*) {
   const uint8_t type = packet[2];
+  const uint8_t version = packet[1];
+  const bool envelope = version == OcciliCapture::ENVELOPE_VERSION;
+  const uint16_t recordBytes = envelope ? OcciliCapture::ENVELOPE_RECORD_BYTES : OcciliCapture::RECORD_BYTES;
+  const uint16_t blockRecords = envelope ? OcciliCapture::ENVELOPE_BLOCK_RECORDS : OcciliCapture::BLOCK_RECORDS;
   const uint8_t flags = packet[3];
   const uint16_t requestId = OcciliCapture::readU16BE(packet + 4);
   const uint16_t captureId = OcciliCapture::readU16BE(packet + 6);
@@ -468,9 +524,9 @@ void acceptCapturePacket(const uint8_t* packet, void*) {
     rejectCapture("FPGA capture error");
     return;
   }
-  if (channel >= ADC_CHANNEL_COUNT || recordsInBlock > OcciliCapture::BLOCK_RECORDS ||
+  if (channel >= ADC_CHANNEL_COUNT || recordsInBlock > blockRecords ||
       (type != OcciliCapture::FRAME_STATUS && totalRecords == 0) ||
-      totalRecords > CAPTURE_RECORD_CAPACITY) {
+      totalRecords > (envelope ? OcciliCapture::MAX_SNAPSHOT_RECORDS : CAPTURE_RECORD_CAPACITY)) {
     rejectCapture("D6 metadata is out of range");
     return;
   }
@@ -479,7 +535,8 @@ void acceptCapturePacket(const uint8_t* packet, void*) {
   const uint8_t triggerMode = packet[14];
   const uint16_t triggerLevel = OcciliCapture::readU16BE(packet + 15);
   uint32_t triggerIndex = OcciliCapture::readU16BE(packet + 17);
-  const uint32_t samplePeriod = (static_cast<uint32_t>(packet[19]) << 16) |
+  const uint32_t samplePeriod = (envelope ? static_cast<uint32_t>(packet[33]) << 24 : 0) |
+                                (static_cast<uint32_t>(packet[19]) << 16) |
                                 (static_cast<uint32_t>(packet[20]) << 8) |
                                 static_cast<uint32_t>(packet[21]);
   const uint32_t firstTick = OcciliCapture::readU32BE(packet + 22);
@@ -500,6 +557,8 @@ void acceptCapturePacket(const uint8_t* packet, void*) {
   captureControlInFlight = false;
 
   if (type == OcciliCapture::FRAME_STATUS) {
+    captureFormatVersion = version;
+    captureRecordBytes = recordBytes;
     captureExpectedRecords = totalRecords;
     captureFocusChannel = channel;
     captureAverageMode = averageMode;
@@ -541,6 +600,8 @@ void acceptCapturePacket(const uint8_t* packet, void*) {
   }
 
   if (!captureMetadataLocked) {
+    captureFormatVersion = version;
+    captureRecordBytes = recordBytes;
     if (captureExpectedRecords != 0 && captureExpectedRecords != totalRecords) {
       rejectCapture("D6 record count changed during download");
       return;
@@ -557,7 +618,7 @@ void acceptCapturePacket(const uint8_t* packet, void*) {
     captureFullScaleMv = fullScaleMv;
     captureConfigRevision = 0;
     captureMetadataLocked = true;
-  } else if (captureExpectedRecords != totalRecords || captureFocusChannel != channel ||
+  } else if (captureFormatVersion != version || captureExpectedRecords != totalRecords || captureFocusChannel != channel ||
              captureAverageMode != averageMode || captureTriggerMode != triggerMode ||
              captureTriggerLevel != triggerLevel || captureTriggerIndex != triggerIndex ||
              captureSamplePeriod != samplePeriod || captureConfigFingerprint != configFingerprint ||
@@ -576,18 +637,14 @@ void acceptCapturePacket(const uint8_t* packet, void*) {
     }
     for (uint8_t index = 0; index < recordsInBlock; ++index) {
       const uint8_t* wireRecord = packet + OcciliCapture::HEADER_BYTES +
-                                   static_cast<size_t>(index) * OcciliCapture::RECORD_BYTES;
+                                   static_cast<size_t>(index) * recordBytes;
       uint8_t* fileRecord = captureArtifact + OcciliCapture::ARTIFACT_HEADER_BYTES +
                             static_cast<size_t>(captureReceivedRecords + index) *
-                                OcciliCapture::RECORD_BYTES;
-      const uint16_t sample = OcciliCapture::readU16BE(wireRecord);
-      const uint32_t tick = OcciliCapture::readU32BE(wireRecord + 2);
-      if (sample > ADC_MAX_COUNT) {
-        rejectCapture("D6 sample is outside the 12-bit ADC range");
+                                recordBytes;
+      if (!OcciliCapture::copyRecord(wireRecord, fileRecord, envelope)) {
+        rejectCapture("D6 sample or envelope is invalid");
         return;
       }
-      OcciliCapture::writeU32LE(fileRecord, tick);
-      OcciliCapture::writeU16LE(fileRecord + 4, sample);
     }
     captureReceivedRecords = static_cast<uint16_t>(captureReceivedRecords + recordsInBlock);
     captureExpectedSequence = static_cast<uint16_t>(sequence + 1U);
@@ -647,7 +704,9 @@ uint32_t nextCaptureRequestId() {
 }
 
 bool armCapture(bool vgaSnapshot = false) {
-  if (captureState == CAPTURE_ARMED || captureState == CAPTURE_RECEIVING) return true;
+  // Do not report an old record as the result of a new ARM request.
+  if (captureState == CAPTURE_RECEIVING ||
+      (captureState == CAPTURE_ARMED && !captureFpgaReady)) return false;
   const uint32_t id = nextCaptureRequestId();
   captureState = CAPTURE_ARMED;
   captureFrozen = false;
@@ -728,42 +787,40 @@ void serviceCaptureProtocol() {
   }
 }
 
-void setFpgaBaud(uint32_t baud) {
+void beginFpgaUart() {
   Serial1.end();
   Serial1.setTX(FPGA_UART_TX_PIN);
   Serial1.setRX(FPGA_UART_RX_PIN);
-  Serial1.begin(baud, SERIAL_8N1);
-  activeFpgaBaud = baud;
-  lastBaudSwitchMillis = millis();
+  Serial1.setFIFOSize(4096);
+  Serial1.begin(FPGA_UART_BAUD, SERIAL_8N1);
   uartLineLength = 0;
   uartDiscardLine = false;
   binaryTelemetryIndex = 0;
+  liveIndex = 0; liveRequested = false;
   captureFrameParser.reset();
   captureLastByteMillis = 0;
-  Serial.print("FPGA UART probing "); Serial.print(baud); Serial.println(" baud");
+  Serial.println("FPGA UART: 115200 baud");
 }
 
-void serviceFpgaAutoBaud() {
-  // A capture transfer is a contiguous binary stream.  Re-probing the UART
-  // while telemetry happens to be quiet would split that stream and make the
-  // frozen record unverifiable.
-  if (captureState == CAPTURE_ARMED || captureState == CAPTURE_RECEIVING) return;
-  const uint32_t now = millis();
-  const bool fresh = telemetry.valid && now - telemetry.lastPacketMillis <= UART_ACTIVE_TIMEOUT_MS;
-  if (fresh) return;
-  if (fpgaBaudLocked) {
-    fpgaBaudLocked = false;
-    telemetry.valid = false;
-    lastBaudSwitchMillis = now - UART_BAUD_SCAN_MS;
-  }
-  if (now - lastBaudSwitchMillis >= UART_BAUD_SCAN_MS) {
-    setFpgaBaud(activeFpgaBaud == FPGA_UART_BAUD_HIGH ?
-                FPGA_UART_BAUD_LOW : FPGA_UART_BAUD_HIGH);
+void serviceLiveFrames() {
+  if (!liveClientMillis || millis()-liveClientMillis > 1500 || liveRequested || liveIndex ||
+      captureState == CAPTURE_ARMED || captureState == CAPTURE_RECEIVING) return;
+  // A response may still hold the previous frame after the published slot
+  // changes. Do not reuse that slot until its HTTP body has been sent.
+  if (httpBody == reinterpret_cast<const char*>(liveFrames[1-liveReady])) return;
+  const uint8_t command = 0xab;
+  if (Serial1.write(command) == 1) {
+    liveRequested = true; liveRequestMillis = millis();
   }
 }
 
 void readFpgaUart() {
   const uint32_t now = millis();
+  if (liveIndex && now - liveByteMillis > 250) {
+    liveIndex = 0; liveRequested = false; telemetry.invalidLineCount++;
+  }
+  if (liveRequested && !liveIndex && now - liveRequestMillis > 2000)
+    liveRequested = false;
   if (captureFrameParser.active() && captureLastByteMillis != 0 &&
       now - captureLastByteMillis > UART_LINE_TIMEOUT_MS) {
     captureFrameParser.clearPartial();
@@ -787,6 +844,21 @@ void readFpgaUart() {
     }
 #endif
 
+    if (fftParser.active() || (incomingByte==0xd8 && !liveIndex && binaryTelemetryIndex==0 &&
+                              !captureFrameParser.active())) {
+      fftLastByteMillis=millis();fftParser.feed(incomingByte,acceptFftFrame);continue;
+    }
+
+    if (liveIndex || (incomingByte == 0xd7 && binaryTelemetryIndex == 0 &&
+                      !captureFrameParser.active())) {
+      if (!liveIndex) {
+        liveReceiving = 1 - liveReady; liveExpected = 0; liveCrc = 0xffff;
+        uartLineLength = 0; uartDiscardLine = false;
+      }
+      acceptLiveByte(incomingByte);
+      continue;
+    }
+
     // A D6 byte inside the nine-byte D5 telemetry packet belongs to that
     // packet. Once D5 has started, let the legacy parser consume all nine
     // bytes before looking for a capture frame again.
@@ -797,7 +869,6 @@ void readFpgaUart() {
         uartLineLength = 0;
         uartDiscardLine = false;
       }
-      fpgaBaudLocked = true;
       captureLastByteMillis = millis();
       continue;
     }
@@ -1002,9 +1073,7 @@ void updatePacketRate() {
   packetRateWindowStart = now;
 }
 
-// ============================================================
 // Incremental HTTP server
-// ============================================================
 
 void resetHttpState(bool stopClient) {
   if (stopClient && httpClient) {
@@ -1129,7 +1198,7 @@ void queueCaptureArtifact() {
   }
   writeCaptureArtifactHeader();
   const size_t artifactLength = OcciliCapture::ARTIFACT_HEADER_BYTES +
-      static_cast<size_t>(captureReceivedRecords) * OcciliCapture::RECORD_BYTES;
+      static_cast<size_t>(captureReceivedRecords) * captureRecordBytes;
   const int written = snprintf(
       httpResponse, sizeof(httpResponse),
       "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n"
@@ -1153,6 +1222,85 @@ void queueCaptureArtifact() {
 void routeHttpRequest() {
   if (httpRequestOverflow) {
     queueSmallResponse(414, "URI Too Long", "text/plain", "Request line is too long.");
+    return;
+  }
+
+  if (startsWith(httpRequestLine,"GET /api/fft/start")) {
+    uint32_t tb=0;
+    if(!readQueryValue32(httpRequestLine,"tb",10,tb)||tb>10) {
+      queueSmallResponse(400,"Bad Request","text/plain","FFT timebase must be 0-10.");return;
+    }
+    if(fftState==FFT_RUNNING||fftDraining||captureState==CAPTURE_ARMED||captureState==CAPTURE_RECEIVING) {
+      queueSmallResponse(409,"Conflict","text/plain","Finish or cancel the current FFT/capture first.");return;
+    }
+    const uint16_t nextId=fftRequestId==65535?1:fftRequestId+1;
+    uint8_t command[5]={0xac,static_cast<uint8_t>(tb),static_cast<uint8_t>(nextId>>8),static_cast<uint8_t>(nextId),0};
+    for(uint8_t i=0;i<4;i++)command[4]^=command[i];
+    if(Serial1.write(command,sizeof(command))!=sizeof(command)) {
+      queueSmallResponse(503,"Service Unavailable","text/plain","FPGA UART is busy.");return;
+    }
+    fftRequestId=nextId;fftState=FFT_RUNNING;fftError="";fftStartedMillis=millis();
+    const uint32_t rawPeriod=telemetry.samplePeriodCycles?telemetry.samplePeriodCycles:8000;
+    const uint64_t durationMs=(static_cast<uint64_t>(rawPeriod)<<tb)*256/50000;
+    fftTimeoutMs=static_cast<uint32_t>(durationMs>115000?120000:durationMs+5000);
+    char body[120];
+    snprintf(body,sizeof(body),"{\"id\":%u,\"timeoutMs\":%lu}",fftRequestId,static_cast<unsigned long>(fftTimeoutMs));
+    queueSmallResponse(202,"Accepted","application/json",body);return;
+  }
+  if(startsWith(httpRequestLine,"GET /api/fft/status") || startsWith(httpRequestLine,"GET /api/fft/data") || startsWith(httpRequestLine,"GET /api/fft/cancel")) {
+    uint32_t id=0;
+    if(!readQueryValue32(httpRequestLine,"id",65535,id)||!id||id!=fftRequestId) {
+      queueSmallResponse(409,"Conflict","text/plain","FFT request was replaced. Capture again.");return;
+    }
+    if(startsWith(httpRequestLine,"GET /api/fft/cancel")) {
+      if(fftState==FFT_RUNNING) {
+        Serial1.write(static_cast<uint8_t>(0xad));fftDraining=true;fftDrainMillis=millis();
+      }
+      fftState=FFT_CANCELLED;fftError="FFT cancelled.";
+      queueSmallResponse(200,"OK","application/json","{\"state\":\"cancelled\"}");return;
+    }
+    if(startsWith(httpRequestLine,"GET /api/fft/status")) {
+      const char* state=fftState==FFT_READY?"ready":fftState==FFT_RUNNING?"running":fftState==FFT_ERROR?"error":fftState==FFT_CANCELLED?"cancelled":"idle";
+      char body[240];snprintf(body,sizeof(body),"{\"id\":%u,\"state\":\"%s\",\"error\":\"%s\"}",fftRequestId,state,fftError);
+      queueSmallResponse(200,"OK","application/json",body);return;
+    }
+    if(fftState!=FFT_READY) {queueSmallResponse(409,"Conflict","text/plain","FFT snapshot is not ready.");return;}
+    snprintf(httpResponse,sizeof(httpResponse),
+      "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nCache-Control: no-store\r\nConnection: close\r\nContent-Length: 550\r\n\r\n");
+    httpResponseLength=strlen(httpResponse);httpResponseOffset=0;
+    httpBody=reinterpret_cast<const char*>(fftArtifact);httpBodyLength=sizeof(fftArtifact);httpBodyOffset=0;
+    httpPromoteToEvents=false;httpLastProgressMillis=millis();httpState=HTTP_SENDING;return;
+  }
+  if(fftState==FFT_RUNNING && startsWith(httpRequestLine,"GET /api/capture/") && !startsWith(httpRequestLine,"GET /api/capture/status")) {
+    queueSmallResponse(409,"Conflict","text/plain","Finish or cancel the FFT before starting a saved capture.");return;
+  }
+
+  if (startsWith(httpRequestLine, "GET /api/live")) {
+    liveClientMillis = millis();
+    const size_t length = liveLengths[liveReady];
+    if (!length) {
+      queueSmallResponse(202,"Accepted","application/json","{\"waiting\":true}");
+      return;
+    }
+    const uint8_t* frame = liveFrames[liveReady];
+    const uint32_t id = static_cast<uint32_t>(frame[20]) |
+        (static_cast<uint32_t>(frame[21]) << 8) |
+        (static_cast<uint32_t>(frame[22]) << 16) |
+        (static_cast<uint32_t>(frame[23]) << 24);
+    uint32_t after = 0;
+    if (readQueryValue32(httpRequestLine,"after",0xffffffffUL,after) && after == id) {
+      queueSmallResponse(204,"No Content","application/octet-stream",nullptr);
+      return;
+    }
+    const int written = snprintf(httpResponse,sizeof(httpResponse),
+        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n"
+        "Cache-Control: no-store\r\nConnection: close\r\nContent-Length: %lu\r\n\r\n",
+        static_cast<unsigned long>(length));
+    httpResponseLength = written > 0 ? static_cast<size_t>(written) : 0;
+    httpResponseOffset = 0;
+    httpBody = reinterpret_cast<const char*>(liveFrames[liveReady]);
+    httpBodyLength = length; httpBodyOffset = 0; httpPromoteToEvents = false;
+    httpLastProgressMillis = millis(); httpState = HTTP_SENDING;
     return;
   }
 
@@ -1389,6 +1537,7 @@ void promoteHttpClientToEvents() {
   lastSseSendMillis = 0;
   lastSseProgressMillis = millis();
   sseMessageLength = 0;
+  sseMessageOffset = 0;
 }
 
 void serviceHttpWriter() {
@@ -1461,9 +1610,7 @@ void serviceHttp() {
   else if (httpState == HTTP_SENDING) serviceHttpWriter();
 }
 
-// ============================================================
 // Nonblocking server-sent events
-// ============================================================
 
 void closeEventClient() {
   if (eventClient) {
@@ -1471,6 +1618,7 @@ void closeEventClient() {
   }
   eventClient = WiFiClient();
   sseMessageLength = 0;
+  sseMessageOffset = 0;
   sseDisconnectCount++;
 }
 
@@ -1493,29 +1641,17 @@ void prepareTelemetryEvent(uint32_t now) {
   int written = snprintf(
       sseMessage, sizeof(sseMessage),
       "data:{\"av\":[%u,%u,%u,%u,%u,%u],\"lo\":[%u,%u,%u,%u,%u,%u],"
-      "\"hi\":[%u,%u,%u,%u,%u,%u],\"nm\":%u,\"vm\":%u,\"sp\":[",
+      "\"hi\":[%u,%u,%u,%u,%u,%u],\"nm\":%u,\"vm\":%u,",
       average[0],average[1],average[2],average[3],average[4],average[5],
       low[0],low[1],low[2],low[3],low[4],low[5],
       high[0],high[1],high[2],high[3],high[4],high[5],newMask,validMask);
   if(written<=0||written>=static_cast<int>(sizeof(sseMessage))){sseMessageLength=0;return;}
 
   size_t length=static_cast<size_t>(written);
-  uint8_t queued=rawSampleCount<RAW_SAMPLES_PER_EVENT?rawSampleCount:RAW_SAMPLES_PER_EVENT;
-  uint8_t tail=rawSampleTail;
-  for(uint8_t index=0;index<queued;index++){
-    const RawPhoneSample& sample=rawSampleQueue[tail];
-    const int added=snprintf(sseMessage+length,sizeof(sseMessage)-length,"%s%u,%u,%u",
-        index==0?"":",",static_cast<unsigned>(sample.channel),
-        static_cast<unsigned>(sample.adc),static_cast<unsigned>(sample.deltaUs));
-    if(added<=0||added>=static_cast<int>(sizeof(sseMessage)-length)){sseMessageLength=0;return;}
-    length+=static_cast<size_t>(added);
-    tail=static_cast<uint8_t>((tail+1U)%RAW_SAMPLE_QUEUE_SIZE);
-  }
-
   written=snprintf(
       sseMessage+length,sizeof(sseMessage)-length,
-      "],\"latest\":%u,\"value\":%u,\"ch\":%u,\"pc\":%lu,\"packets\":%lu,\"pps\":%lu,"
-      "\"cmds\":%lu,\"errors\":%lu,\"dropped\":%lu,\"uptime\":%lu,\"baud\":%lu,\"fresh\":%s,"
+      "\"latest\":%u,\"value\":%u,\"ch\":%u,\"pc\":%lu,\"packets\":%lu,\"pps\":%lu,"
+      "\"cmds\":%lu,\"errors\":%lu,\"uptime\":%lu,\"baud\":%lu,\"fresh\":%s,"
       "\"g0e\":%s,\"g0hz\":%lu,\"g0d\":%u,\"g1e\":%s,\"g1hz\":%lu,\"g1d\":%u}\n\n",
       static_cast<unsigned>(telemetry.adcLatest),
       static_cast<unsigned>(telemetry.value),
@@ -1525,15 +1661,14 @@ void prepareTelemetryEvent(uint32_t now) {
       static_cast<unsigned long>(telemetry.packetsPerSecond),
       static_cast<unsigned long>(commandsSent),
       static_cast<unsigned long>(telemetry.invalidLineCount),
-      static_cast<unsigned long>(rawSampleDropped),
-       static_cast<unsigned long>(now), static_cast<unsigned long>(activeFpgaBaud),
+       static_cast<unsigned long>(now), static_cast<unsigned long>(FPGA_UART_BAUD),
        fresh ? "true" : "false", generators[0].enabled ? "true" : "false",
        static_cast<unsigned long>(generators[0].actualHz), static_cast<unsigned>(generators[0].dutyPercent),
        generators[1].enabled ? "true" : "false",
        static_cast<unsigned long>(generators[1].actualHz), static_cast<unsigned>(generators[1].dutyPercent));
   if(written<=0||written>=static_cast<int>(sizeof(sseMessage)-length)){sseMessageLength=0;return;}
   sseMessageLength=length+static_cast<size_t>(written);
-  rawSampleTail=tail;rawSampleCount=static_cast<uint8_t>(rawSampleCount-queued);
+  sseMessageOffset=0;
 }
 
 void serviceEvents() {
@@ -1546,40 +1681,36 @@ void serviceEvents() {
   }
 
   const uint32_t now = millis();
-  if (sseMessageLength == 0 && now - lastSseSendMillis >= SSE_INTERVAL_MS && telemetry.valid) {
+  if (sseMessageLength == 0 && now - lastSseSendMillis >= SSE_INTERVAL_MS) {
     prepareTelemetryEvent(now);
   }
 
   if (sseMessageLength > 0) {
-    if (eventClient.availableForWrite() >= static_cast<int>(sseMessageLength)) {
+    const int writable = eventClient.availableForWrite();
+    if (writable > 0) {
+      size_t chunk = sseMessageLength - sseMessageOffset;
+      if (chunk > 256) chunk = 256;
+      if (chunk > static_cast<size_t>(writable)) chunk = static_cast<size_t>(writable);
       const size_t sent = eventClient.write(
-          reinterpret_cast<const uint8_t*>(sseMessage), sseMessageLength);
-      if (sent != sseMessageLength) {
-        closeEventClient();
-        return;
+          reinterpret_cast<const uint8_t*>(sseMessage) + sseMessageOffset, chunk);
+      if (sent > 0) {
+        sseMessageOffset += sent;
+        lastSseProgressMillis = now;
+        if (sseMessageOffset == sseMessageLength) {
+          sseMessageLength = 0; sseMessageOffset = 0;
+          lastSseSendMillis = now;
+        }
       }
-      sseMessageLength = 0;
-      lastSseSendMillis = now;
-      lastSseProgressMillis = now;
-    } else if (now - lastSseProgressMillis > SSE_STALL_TIMEOUT_MS) {
+    }
+    if (sseMessageLength && now - lastSseProgressMillis > SSE_STALL_TIMEOUT_MS) {
       closeEventClient();
     }
     return;
   }
 
-  if (now - lastSseSendMillis >= SSE_KEEPALIVE_MS) {
-    static constexpr char KEEPALIVE[] = ": keepalive\n\n";
-    if (eventClient.availableForWrite() >= static_cast<int>(sizeof(KEEPALIVE) - 1)) {
-      eventClient.write(reinterpret_cast<const uint8_t*>(KEEPALIVE), sizeof(KEEPALIVE) - 1);
-      lastSseSendMillis = now;
-      lastSseProgressMillis = now;
-    }
-  }
 }
 
-// ============================================================
 // Wi-Fi, status LED, setup, and loop
-// ============================================================
 
 void tryStartWifi() {
   const uint32_t now = millis();
@@ -1628,7 +1759,7 @@ void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
   setLed(false);
   Serial.begin(115200);
-  setFpgaBaud(FPGA_UART_BAUD_HIGH);
+  beginFpgaUart();
   delay(200);
 
   Serial.println();
@@ -1659,10 +1790,11 @@ void loop() {
 #endif
   readFpgaUart();
   serviceCaptureProtocol();
-  serviceFpgaAutoBaud();
+  serviceFftProtocol();
   serviceUsbCommands();
   updatePacketRate();
   serviceHttp();
+  serviceLiveFrames();
   serviceEvents();
   tryStartWifi();
   updateStatusLed();

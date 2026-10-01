@@ -19,5 +19,10 @@ jobs:
         run: |
           node --check web/capture_protocol.js
           node --check web/scope.js
-      - name: Run capture protocol tests
-        run: node --test web/tests/capture_protocol.test.js
+      - name: Run browser protocol and control tests
+        run: npm test
+      - name: Check FFT arithmetic and UART parser
+        run: |
+          python3 tests/fft_math_test.py
+          g++ -std=c++11 tests/fft_protocol_test.cpp -o /tmp/fft_protocol_test
+          /tmp/fft_protocol_test tests/fixtures/fft_snapshot.bin

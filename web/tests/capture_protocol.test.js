@@ -148,3 +148,87 @@ test("converts selected generator units to bounded FPGA hertz", () => {
   assert.equal(protocol.frequencyToHertz(3, "MHz"), 2000000);
   assert.throws(() => protocol.frequencyToHertz(1, "rpm"), /invalid/i);
 });
+
+test("lists every hardware time scale using the measured acquisition interval", () => {
+  const options = protocol.vgaTimeOptions(800);
+  assert.equal(options.length, 11);
+  assert.equal(options[0].seconds, 0.009216);
+  assert.equal(options[10].seconds, 9.437184);
+  for (const option of options) {
+    assert.equal(protocol.selectVgaTimebase(option.seconds, 800).timebase, option.timebase);
+  }
+  assert.equal(protocol.vgaTimeOptions(3200)[4].seconds, options[4].seconds * 4);
+  assert.deepEqual(protocol.vgaTimeOptions(0), []);
+});
+
+function envelopeFixture() {
+  const ticks = Array.from({length: 128}, (_, index) => index * 1000);
+  const values = ticks.map((_, index) => Math.floor(index / 16) % 2 ? 3000 : 1000);
+  const original = fixture({ticks, values, triggerIndex: 32});
+  const bytes = new Uint8Array(64 + ticks.length * 10);
+  bytes.set(original.subarray(0, 64));
+  bytes[4] = protocol.ENVELOPE_VERSION;
+  put16(bytes, 10, 10);
+  ticks.forEach((tick, index) => {
+    const offset = 64 + index * 10;
+    put32(bytes, offset, tick);
+    put16(bytes, offset + 4, values[index]);
+    put16(bytes, offset + 6, 500);
+    put16(bytes, offset + 8, 3500);
+  });
+  return bytes;
+}
+
+test("snapshot envelopes retain peaks while measurements use the mean trace", () => {
+  const record = protocol.decodeCapture(envelopeFixture());
+  assert.equal(record.envelope, true);
+  assert.equal(record.validCount, 128);
+  const measurement = protocol.measureRecord(record);
+  assert.equal(measurement.min, 500);
+  assert.equal(measurement.max, 3500);
+  assert.equal(measurement.average, 2000);
+  assert.equal(measurement.peakToPeak, 3000);
+  assert.match(protocol.csvForCapture(record), /valid,low,high/);
+});
+
+test("rejects malformed snapshot sizes and marks invalid envelopes", () => {
+  const bytes = envelopeFixture();
+  put16(bytes, 64 + 6, 2000); // minimum exceeds the mean
+  const record = protocol.decodeCapture(bytes);
+  assert.equal(record.samples[0].valid, false);
+  assert.equal(protocol.measureRecord(record).valid, false);
+  put16(bytes, 10, 6);
+  assert.throws(() => protocol.decodeCapture(bytes), /record size/i);
+});
+
+
+function fftFixture() {
+  return new Uint8Array(require("node:fs").readFileSync(require("node:path").join(__dirname,"../../tests/fixtures/fft_snapshot.bin")));
+}
+function fftChecksum(bytes) {
+  let crc=0xffff;
+  for(let i=0;i<548;i++){
+    crc^=bytes[i]<<8;
+    for(let bit=0;bit<8;bit++)crc=((crc<<1)^((crc&0x8000)?0x1021:0))&0xffff;
+  }
+  put16(bytes,548,crc);return bytes;
+}
+test("FPGA FFT snapshot preserves measured frequency, DC and calibrated amplitude",()=>{
+  const snapshot=protocol.decodeFftFrame(fftFixture());
+  assert.equal(snapshot.focus,1);assert.equal(snapshot.id,7);
+  assert.equal(snapshot.bins.length,129);assert.equal(snapshot.sampleRateHz,12500);
+  assert.ok(Math.abs(snapshot.peak.frequencyHz-781.25)<1);assert.equal(snapshot.dcVolts,2.5);
+  assert.ok(Math.abs(snapshot.peak.amplitudeVolts-1.25)<0.025);
+  assert.equal(snapshot.nyquistHz,6250);assert.equal(snapshot.durationMs,20.4);
+});
+test("FFT rejects truncated, corrupted, failed and inconsistent snapshots",()=>{
+  assert.throws(()=>protocol.decodeFftFrame(fftFixture().slice(0,-1)),/Incomplete/);
+  const corrupted=fftFixture();corrupted[90]^=128;
+  assert.throws(()=>protocol.decodeFftFrame(corrupted),/checksum/);
+  const failed=fftFixture();failed[4]=4;fftChecksum(failed);
+  assert.throws(()=>protocol.decodeFftFrame(failed),/invalid/);
+  const changed=fftFixture();put32(changed,12,8000);fftChecksum(changed);
+  assert.throws(()=>protocol.decodeFftFrame(changed),/metadata/);
+  const precision=fftFixture();precision[31]=7;fftChecksum(precision);
+  assert.throws(()=>protocol.decodeFftFrame(precision),/metadata/);
+});

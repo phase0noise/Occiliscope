@@ -1,36 +1,24 @@
-# Quartus generated databases and programming outputs
+# Programming images are the only generated files published with the project.
+output_files/*
+!output_files/oscilloscope.sof
+!output_files/oscilloscope.pof
+!output_files/pico_scope.uf2
+
+# Quartus databases and local build/browser caches.
 db/
 incremental_db/
-output_files/
-
-# Quartus workspace state and automatic backups
+.cache/
+build/
 *.qws
 *.bak
-
-# Generated simulator work libraries and netlists
-simulation/work/
-simulation/control_work/
-simulation/questa/
-
-# Local validation builds. Keep only the two files used to program the FPGA.
-build/*
-!build/quartus/
-build/quartus/*
-!build/quartus/output_files/
-build/quartus/output_files/*
-!build/quartus/output_files/oscilloscope.sof
-!build/quartus/output_files/oscilloscope.pof
-.sim_capture/
-
-# Local diagnostics and vendor/example dumps are not active project sources
 *.log
-work/
-referance/
+node_modules/
 
-# Editor-specific launch state
+# Editor state and simulator work libraries.
 .theia/
-
-# Retired coil-control design kept locally for reference
-/fire.vhd
-/position_control.vhd
-/simulation/position_control_tb.vhd
+**/.theia/
+work/
+tests/hdl/work/
+tests/hdl/questa/
+simulation/
+.sim_capture/

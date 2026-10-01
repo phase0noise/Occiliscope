@@ -21,12 +21,17 @@ module scope_vga (
     input  wire [11:0] trigger_level,
     input  wire        grid_enable,
     input  wire        run_enable,
+    input  wire        manual_mode,
     input  wire [1:0]  trigger_position,
     input  wire        single_shot,
     input  wire [1:0]  average_mode,
     input  wire        stabilize_enable,
     input  wire [23:0] sample_period_cycles,
     input  wire [15:0] full_scale_mv,
+    input  wire        live_request,
+    output wire [7:0]  live_tx_data,
+    output wire        live_tx_valid,
+    input  wire        live_tx_pop,
     output reg  [3:0]  VGA_R,
     output reg  [3:0]  VGA_G,
     output reg  [3:0]  VGA_B,
@@ -70,6 +75,7 @@ module scope_vga (
     reg [11:0] render_trigger_level;
     reg render_grid_enable;
     reg render_run_enable;
+    reg render_manual_mode;
     reg [1:0] render_trigger_position;
     reg render_single_shot;
     reg [1:0] render_average_mode;
@@ -90,6 +96,15 @@ module scope_vga (
     reg [55:0] bcd_time_shift;
     reg [55:0] bcd_axis_mid_time_shift, bcd_axis_end_time_shift;
     reg [5:0] display_bcd_count;
+    reg [29:0] channel_voltage_shift [0:5];
+    reg [15:0] channel_voltage_bcd [0:5];
+    wire [27:0] channel_mv_product [0:5];
+    integer voltage_index;
+    genvar voltage_ch;
+    generate for (voltage_ch=0; voltage_ch<6; voltage_ch=voltage_ch+1) begin: header_voltage
+        assign channel_mv_product[voltage_ch] =
+            render_channel_samples[voltage_ch*12 +: 12] * render_full_scale_mv;
+    end endgenerate
 
     // Quartus recognizes this as a 1024 x 12 simple dual-port RAM.
     reg [11:0] sample_memory [0:1023] /* synthesis ramstyle = "M9K" */;
@@ -127,6 +142,8 @@ module scope_vga (
     reg snapshot_copy_active;
     reg snapshot_copy_valid;
     reg frame_snapshot_ready;
+    reg triggered_snapshot_ready;
+    reg capture_was_triggered;
     reg [9:0] snapshot_start;
     reg [9:0] snapshot_read_address;
     reg [9:0] snapshot_copy_index;
@@ -175,6 +192,9 @@ module scope_vga (
     reg [2:0] capture_channel;
     reg [5:0] capture_mask;
     reg [3:0] capture_timebase;
+    reg [1:0] capture_average, capture_trigger_mode, capture_trigger_position;
+    reg [11:0] capture_trigger_level;
+    reg capture_single;
 
     reg [11:0] measure_min_work;
     reg [11:0] measure_max_work;
@@ -201,15 +221,53 @@ module scope_vga (
     wire sample_crossing = rising_trigger || falling_trigger;
 
     wire frame_tick = pixel_phase && h_count == H_TOTAL-1 && v_count == V_TOTAL-1;
+    wire snapshot_refresh = !channel_stable || !triggered_snapshot_ready ||
+                            capture_frozen || trigger_mode == 0 || !run_enable;
     wire channel_stable = channel == capture_channel &&
                           channel_mask == capture_mask &&
-                          timebase == capture_timebase;
+                          timebase == capture_timebase &&
+                          average_mode == capture_average &&
+                          trigger_mode == capture_trigger_mode &&
+                          trigger_position == capture_trigger_position &&
+                          trigger_level == capture_trigger_level &&
+                          single_shot == capture_single;
+    // Start a fresh column at the first qualified raw edge. Otherwise the
+    // decimator's arbitrary phase can move a slow-scale trigger by one column.
+    wire trigger_edge = sample_strobe && channel_stable && run_enable &&
+                        !capture_frozen && trigger_mode != 0 && !trigger_active &&
+                        !trigger_pending && valid_sample_count >= pretrigger_samples &&
+                        sample_crossing;
     wire accept_sample = sample_strobe && channel_stable && !capture_frozen &&
-                         run_enable &&
+                         run_enable && !trigger_edge &&
                          decimation_count == decimation_limit;
     wire [9:0] first_valid_x = 10'd616 - render_valid_count;
     wire trace_column_valid = h_display >= first_valid_x;
     wire previous_column_valid = h_display > first_valid_x;
+
+    wire [71:0] live_column_min, live_column_max;
+    genvar live_ch;
+    generate for (live_ch=0; live_ch<6; live_ch=live_ch+1) begin: live_extrema
+        assign live_column_min[live_ch*12 +: 12] = render_channel == live_ch ?
+            snapshot_min_sample : snapshot_channel_min[live_ch*12 +: 12];
+        assign live_column_max[live_ch*12 +: 12] = render_channel == live_ch ?
+            snapshot_max_sample : snapshot_channel_max[live_ch*12 +: 12];
+    end endgenerate
+    scope_live phone_window (
+        .clk(clk), .reset(reset), .request(live_request), .frame_begin(frame_tick && snapshot_refresh),
+        .column_write(snapshot_copy_active && snapshot_copy_valid && !frame_tick),
+        .column_index(snapshot_copy_index-10'd1), .column_mean(snapshot_channel_traces),
+        .column_min(live_column_min), .column_max(live_column_max),
+        .column_valid(snapshot_copy_index > PLOT_WIDTH-render_valid_count ?
+                      snapshot_channel_valid & render_channel_mask : 6'd0),
+        .channel_mask(channel_mask), .focus(channel), .timebase(timebase),
+        .scale(vertical_scale), .position(vertical_position), .trigger_mode(trigger_mode),
+        .trigger_position(trigger_position), .trigger_level(trigger_level),
+        .manual_mode(manual_mode), .grid(grid_enable), .run(run_enable), .single_shot(single_shot),
+        .average_mode(average_mode), .stabilize(stabilize_enable),
+        .sample_period(sample_period_cycles), .full_scale_mv(full_scale_mv),
+        .valid_columns(channel_stable ? history_valid_count : 10'd0),
+        .tx_data(live_tx_data), .tx_valid(live_tx_valid), .tx_pop(live_tx_pop)
+    );
 
     always @* begin
         capture_index = 0;
@@ -328,6 +386,10 @@ module scope_vga (
     always @(posedge clk) begin
         if (reset) begin
             display_bcd_count <= 0;
+            for(voltage_index=0;voltage_index<6;voltage_index=voltage_index+1) begin
+                channel_voltage_shift[voltage_index] <= 0;
+                channel_voltage_bcd[voltage_index] <= 0;
+            end
             display_adc_bcd <= 0; display_now_bcd <= 0; display_min_bcd <= 0; display_max_bcd <= 0;
             display_pp_bcd <= 0; display_avg_bcd <= 0; display_level_bcd <= 0;
             display_vdiv_bcd <= 0; display_time_bcd <= 0;
@@ -344,6 +406,9 @@ module scope_vga (
             bcd_axis_bottom_shift <= 0;
         end else if (display_bcd_count == 0) begin
             if (frame_tick) begin
+                for(voltage_index=0;voltage_index<6;voltage_index=voltage_index+1)
+                    channel_voltage_shift[voltage_index] <=
+                        {16'd0, ((channel_mv_product[voltage_index] + 2048) >> 12)};
                 bcd_adc_shift <= {18'd0, latest_sample};
                 bcd_now_shift <= {16'd0, ((now_mv_product + 2048) >> 12)};
                 bcd_min_shift <= {16'd0, ((min_mv_product + 2048) >> 12)};
@@ -364,6 +429,8 @@ module scope_vga (
             end
         end else begin
             if (display_bcd_count > 10) begin
+                for(voltage_index=0;voltage_index<6;voltage_index=voltage_index+1)
+                    channel_voltage_shift[voltage_index] <= bcd_step4(channel_voltage_shift[voltage_index]);
                 bcd_adc_shift <= bcd_step4(bcd_adc_shift);
                 bcd_now_shift <= bcd_step4(bcd_now_shift);
                 bcd_min_shift <= bcd_step4(bcd_min_shift);
@@ -383,6 +450,8 @@ module scope_vga (
             bcd_axis_end_time_shift <= bcd_step8(bcd_axis_end_time_shift);
             display_bcd_count <= display_bcd_count - 1'b1;
             if (display_bcd_count == 11) begin
+                for(voltage_index=0;voltage_index<6;voltage_index=voltage_index+1)
+                    channel_voltage_bcd[voltage_index] <= bcd_step4(channel_voltage_shift[voltage_index]) >> 14;
                 display_adc_bcd <= bcd_step4(bcd_adc_shift) >> 14;
                 display_now_bcd <= bcd_step4(bcd_now_shift) >> 14;
                 display_min_bcd <= bcd_step4(bcd_min_shift) >> 14;
@@ -414,6 +483,7 @@ module scope_vga (
             valid_sample_count     <= 10'd0;
             previous_sample        <= 12'd0;
             trigger_active         <= 1'b0;
+            capture_was_triggered <= 1'b0;
             trigger_armed          <= 1'b0;
             trigger_pending        <= 1'b0;
             posttrigger_remaining  <= 10'd0;
@@ -436,6 +506,9 @@ module scope_vga (
             capture_channel        <= 3'd0;
             capture_mask           <= 6'b000001;
             capture_timebase       <= 4'd0;
+            capture_average <= 0; capture_trigger_mode <= 3;
+            capture_trigger_position <= 1; capture_trigger_level <= 2048;
+            capture_single <= 0;
             channel_min_work       <= 72'd0;
             channel_max_work       <= 72'd0;
             for (accumulator_index = 0; accumulator_index < 6; accumulator_index = accumulator_index + 1) begin
@@ -460,8 +533,12 @@ module scope_vga (
                 capture_channel <= channel;
                 capture_mask <= channel_mask;
                 capture_timebase <= timebase;
+                capture_average <= average_mode; capture_trigger_mode <= trigger_mode;
+                capture_trigger_position <= trigger_position;
+                capture_trigger_level <= trigger_level; capture_single <= single_shot;
                 write_pointer <= 10'd0;display_start <= 10'd0;decimation_count <= 10'd0;
                 valid_sample_count <= 10'd0;trigger_active <= 1'b0;trigger_armed <= 1'b0;
+                capture_was_triggered <= 1'b0;
                 trigger_pending <= 1'b0;capture_frozen <= 1'b0;frozen_frames <= 6'd0;
                 auto_timeout_count <= 13'd0;
                 channel_seen_work <= 6'd0;
@@ -533,18 +610,29 @@ module scope_vga (
                     if (sample_data < decimation_min) decimation_min <= sample_data;
                     if (sample_data > decimation_max) decimation_max <= sample_data;
                 end
-                if ((trigger_mode == 2'd1 || trigger_mode == 2'd3) &&
-                    sample_data <= trigger_lower)
-                    trigger_armed <= 1'b1;
-                else if (trigger_mode == 2'd2 && sample_data >= trigger_upper)
-                    trigger_armed <= 1'b1;
-                if (trigger_mode != 0 && !trigger_active &&
-                    valid_sample_count >= pretrigger_samples && sample_crossing)
+                if (trigger_edge) begin
                     trigger_pending <= 1'b1;
-                if (decimation_count == decimation_limit)
-                    decimation_count <= 8'd0;
-                else
-                    decimation_count <= decimation_count + 1'b1;
+                    trigger_armed <= 1'b0;
+                    decimation_count <= 10'd0;
+                    decimation_min <= 12'hfff;
+                    decimation_max <= 12'd0;
+                    channel_seen_work <= 6'd0;
+                    for (accumulator_index = 0; accumulator_index < 6; accumulator_index = accumulator_index + 1) begin
+                        channel_sum_work[accumulator_index] <= 22'd0;
+                        channel_count_work[accumulator_index] <= 11'd0;
+                    end
+                end else begin
+                    if (!trigger_pending && !trigger_active) begin
+                        if ((trigger_mode == 2'd1 || trigger_mode == 2'd3) && sample_data <= trigger_lower)
+                            trigger_armed <= 1'b1;
+                        else if (trigger_mode == 2'd2 && sample_data >= trigger_upper)
+                            trigger_armed <= 1'b1;
+                    end
+                    if (decimation_count == decimation_limit)
+                        decimation_count <= 10'd0;
+                    else
+                        decimation_count <= decimation_count + 1'b1;
+                end
             end
 
             if (accept_sample) begin
@@ -589,14 +677,15 @@ module scope_vga (
 
                 if (trigger_mode != 0 && !trigger_active &&
                     valid_sample_count >= pretrigger_samples &&
-                    (trigger_pending || sample_crossing)) begin
+                    trigger_pending) begin
                     trigger_active <= 1'b1;
+                    capture_was_triggered <= 1'b1;
                     trigger_armed <= 1'b0;
                     trigger_pending <= 1'b0;
                     auto_timeout_count <= 13'd0;
                     posttrigger_remaining <= PLOT_WIDTH - pretrigger_samples - 1'b1;
                 end else if (trigger_active) begin
-                    if (posttrigger_remaining == 0) begin
+                    if (posttrigger_remaining <= 1) begin
                         capture_frozen <= 1'b1;
                         trigger_active <= 1'b0;
                         display_start <= write_pointer - (PLOT_WIDTH-1);
@@ -608,6 +697,7 @@ module scope_vga (
                     // Give slow signals four complete windows to reach the
                     // selected edge before AUTO falls back to an unlocked view.
                     if (auto_timeout_count >= PLOT_WIDTH*4-1) begin
+                        capture_was_triggered <= 1'b0;
                         capture_frozen <= 1'b1;
                         display_start <= write_pointer - (PLOT_WIDTH-1);
                         frozen_frames <= 6'd0;
@@ -627,6 +717,12 @@ module scope_vga (
                     (stabilize_enable && frozen_frames == 6'd5)) begin
                     capture_frozen <= 1'b0;
                     valid_sample_count <= 10'd0;
+                    decimation_count <= 10'd0;
+                    channel_seen_work <= 6'd0;
+                    for (accumulator_index = 0; accumulator_index < 6; accumulator_index = accumulator_index + 1) begin
+                        channel_sum_work[accumulator_index] <= 22'd0;
+                        channel_count_work[accumulator_index] <= 11'd0;
+                    end
                     trigger_armed <= 1'b0;
                     trigger_pending <= 1'b0;
                     frozen_frames <= 6'd0;
@@ -669,6 +765,7 @@ module scope_vga (
             render_trigger_level <= 12'd2048;
             render_grid_enable <= 1'b1;
             render_run_enable <= 1'b1;
+            render_manual_mode <= 1'b0;
             render_trigger_position <= 2'd1;
             render_single_shot <= 1'b0;
             render_average_mode <= 2'd0;
@@ -678,11 +775,15 @@ module scope_vga (
             snapshot_copy_active <= 1'b0;
             snapshot_copy_valid <= 1'b0;
             frame_snapshot_ready <= 1'b0;
+            triggered_snapshot_ready <= 1'b0;
             snapshot_start <= 10'd0;
             snapshot_read_address <= 10'd0;
             snapshot_copy_index <= 10'd0;
         end else begin
             pixel_phase <= ~pixel_phase;
+            if (!channel_stable || trigger_mode == 0) triggered_snapshot_ready <= 1'b0;
+            else if (frame_tick && capture_frozen && history_valid_count == PLOT_WIDTH)
+                triggered_snapshot_ready <= capture_was_triggered;
 
             // Copy the 576-point view during vertical blanking. Acquisition
             // continues during the copy: the 1024-point ring leaves 448 spare
@@ -694,8 +795,10 @@ module scope_vga (
                 // way down the screen and produce a one-frame horizontal tear.
                 render_channel <= channel;
                 render_channel_mask <= channel_mask;
-                render_seen_mask <= channel_stable ? channel_seen_since_selection : 6'd0;
-                render_valid_count <= channel_stable ? history_valid_count : 10'd0;
+                if (snapshot_refresh) begin
+                    render_seen_mask <= channel_stable ? channel_seen_since_selection : 6'd0;
+                    render_valid_count <= channel_stable ? history_valid_count : 10'd0;
+                end
                 render_channel_samples <= channel_samples;
                 render_timebase <= timebase;
                 render_vertical_scale <= vertical_scale;
@@ -704,6 +807,7 @@ module scope_vga (
                 render_trigger_level <= trigger_level;
                 render_grid_enable <= grid_enable;
                 render_run_enable <= run_enable;
+                render_manual_mode <= manual_mode;
                 render_trigger_position <= trigger_position;
                 render_single_shot <= single_shot;
                 render_average_mode <= average_mode;
@@ -713,12 +817,16 @@ module scope_vga (
                 // is measured against the 50 MHz system clock. 590/512 is the
                 // rounded fixed-point form of 576/500.
                 render_time_div_us <= (time_div_scaled + 9'd256) >> 9;
-                snapshot_start <= display_start;
-                snapshot_read_address <= display_start;
-                snapshot_copy_index <= 10'd0;
-                snapshot_copy_active <= 1'b1;
-                snapshot_copy_valid <= 1'b0;
-                frame_snapshot_ready <= 1'b0;
+                // Keep the last complete triggered view while the next long
+                // acquisition fills. Free-run continues refreshing each frame.
+                if (snapshot_refresh) begin
+                    snapshot_start <= display_start;
+                    snapshot_read_address <= display_start;
+                    snapshot_copy_index <= 10'd0;
+                    snapshot_copy_active <= 1'b1;
+                    snapshot_copy_valid <= 1'b0;
+                    frame_snapshot_ready <= 1'b0;
+                end
             end else if (snapshot_copy_active) begin
                 if (snapshot_copy_valid) begin
                     frame_sample_memory[snapshot_copy_index-1'b1] <= snapshot_sample;
@@ -825,6 +933,7 @@ module scope_vga (
                 "-": if(row==3) glyph=5'b11111;
                 ".": if(row==6) glyph=5'b00100;
                 ":": if(row==2 || row==4) glyph=5'b00100;
+                ">": case(row) 1:glyph=5'b10000;2:glyph=5'b01000;3:glyph=5'b00100;4:glyph=5'b01000;5:glyph=5'b10000;endcase
                 "/": case(row) 0:glyph=5'b00001;1:glyph=5'b00010;2:glyph=5'b00010;3:glyph=5'b00100;4:glyph=5'b01000;5:glyph=5'b01000;6:glyph=5'b10000;endcase
                 "%": case(row) 0:glyph=5'b11001;1:glyph=5'b11010;2:glyph=5'b00100;3:glyph=5'b00100;4:glyph=5'b01011;5:glyph=5'b10011;6:glyph=5'b00000;endcase
                 default: glyph=5'b00000;
@@ -908,64 +1017,19 @@ module scope_vga (
 
     // Text grid character generator. Essential settings and measurements live
     // in a compact bottom strip, leaving nearly the full VGA width for signal.
-    function [11:0] channel_sample_value;
-        input [2:0] selected;
-        begin
-            case (selected)
-                3'd0: channel_sample_value = render_channel_samples[11:0];
-                3'd1: channel_sample_value = render_channel_samples[23:12];
-                3'd2: channel_sample_value = render_channel_samples[35:24];
-                3'd3: channel_sample_value = render_channel_samples[47:36];
-                3'd4: channel_sample_value = render_channel_samples[59:48];
-                default: channel_sample_value = render_channel_samples[71:60];
-            endcase
-        end
-    endfunction
-
     function [7:0] screen_character;
         input [6:0] column;
         input [5:0] line;
         integer p;
-        integer active_ch;
-        reg [11:0] active_sample;
         begin
             screen_character = " ";
             p = 0;
-            active_ch = 0;
-            active_sample = 12'd0;
-            if (line == 1 && column >= 2 && column < 32) begin
-                case(column-2)
-                    0:screen_character="D";1:screen_character="E";2:screen_character="1";3:screen_character="0";4:screen_character="-";
-                    5:screen_character="L";6:screen_character="I";7:screen_character="T";8:screen_character="E";10:screen_character="D";
-                    11:screen_character="I";12:screen_character="G";13:screen_character="I";14:screen_character="T";15:screen_character="A";
-                    16:screen_character="L";18:screen_character="O";19:screen_character="S";20:screen_character="C";21:screen_character="I";
-                    22:screen_character="L";23:screen_character="L";24:screen_character="O";25:screen_character="S";26:screen_character="C";
-                    27:screen_character="O";28:screen_character="P";29:screen_character="E";default:screen_character=" ";
-                endcase
-            end else if (line == 3 && column >= 2 && column < 74) begin
-                // One compact live readout per ADC input.  The focus marker and
-                // enabled/disabled state make multi-channel scan configuration
-                // visible on the monitor without altering the focus waveform.
-                if(column<14)begin active_ch=0;p=column-2;end
-                else if(column<26)begin active_ch=1;p=column-14;end
-                else if(column<38)begin active_ch=2;p=column-26;end
-                else if(column<50)begin active_ch=3;p=column-38;end
-                else if(column<62)begin active_ch=4;p=column-50;end
-                else begin active_ch=5;p=column-62;end
-                active_sample=channel_sample_value(active_ch[2:0]);
-                if(p==0)screen_character=(render_channel==active_ch)?">":" ";
-                else if(p==1)screen_character="C";
-                else if(p==2)screen_character="H";
-                else if(p==3)screen_character="0"+active_ch;
-                else if(p==5 && render_channel_mask[active_ch])screen_character=hex_digit(active_sample[11:8]);
-                else if(p==6 && render_channel_mask[active_ch])screen_character=hex_digit(active_sample[7:4]);
-                else if(p==7 && render_channel_mask[active_ch])screen_character=hex_digit(active_sample[3:0]);
-                else if((p==5||p==6||p==7) && !render_channel_mask[active_ch])screen_character="-";
-            end else if (line == 50) begin
+            if (line == 50) begin
                 if(column==5)screen_character="C";else if(column==6)screen_character="H";else if(column==7)screen_character="0"+render_channel;
                 else if(column>=10 && column<17) begin
                     p=column-10;
-                    if(!render_run_enable)case(p)0:screen_character="H";1:screen_character="O";2:screen_character="L";3:screen_character="D";endcase
+                    if(render_manual_mode)case(p)0:screen_character="M";1:screen_character="A";2:screen_character="N";3:screen_character="U";4:screen_character="A";5:screen_character="L";endcase
+                    else if(!render_run_enable)case(p)0:screen_character="H";1:screen_character="O";2:screen_character="L";3:screen_character="D";endcase
                     else if(render_single_shot && capture_frozen)case(p)0:screen_character="S";1:screen_character="I";2:screen_character="N";3:screen_character="G";4:screen_character="L";5:screen_character="E";endcase
                     else if(capture_frozen)case(p)0:screen_character="C";1:screen_character="A";2:screen_character="P";3:screen_character="T";endcase
                     else case(p)0:screen_character="A";1:screen_character="R";2:screen_character="M";3:screen_character="E";4:screen_character="D";endcase
@@ -989,97 +1053,6 @@ module scope_vga (
                     if(p==0)screen_character="L";else if(p==1)screen_character="V";else if(p==2)screen_character="L";
                     else if(p>=4)screen_character=voltage_readout_character(display_level_bcd,p-4);
                 end
-            end else if (line == 53) begin
-                if(column>=5 && column<17)begin p=column-5;if(p==0)screen_character="N";else if(p==1)screen_character="O";else if(p==2)screen_character="W";else if(p>=4)screen_character=voltage_readout_character(display_now_bcd,p-4);end
-                else if(column>=19 && column<31)begin p=column-19;if(p==0)screen_character="M";else if(p==1)screen_character="I";else if(p==2)screen_character="N";else if(p>=4)screen_character=voltage_readout_character(display_min_bcd,p-4);end
-                else if(column>=33 && column<45)begin p=column-33;if(p==0)screen_character="M";else if(p==1)screen_character="A";else if(p==2)screen_character="X";else if(p>=4)screen_character=voltage_readout_character(display_max_bcd,p-4);end
-                else if(column>=47 && column<59)begin p=column-47;if(p==0)screen_character="P";else if(p==1)screen_character="P";else if(p>=3)screen_character=voltage_readout_character(display_pp_bcd,p-3);end
-                else if(column>=61 && column<75)begin p=column-61;if(p==0)screen_character="A";else if(p==1)screen_character="V";else if(p==2)screen_character="G";else if(p>=4)screen_character=voltage_readout_character(display_avg_bcd,p-4);end
-            end else if (line == 56) begin
-                if(column>=5 && column<13)begin p=column-5;if(p==0)screen_character="P";else if(p==1)screen_character="O";else if(p==2)screen_character="S";else if(p==4)case(render_trigger_position)0:screen_character="1";1:screen_character="2";2:screen_character="5";3:screen_character="7";endcase else if(p==5)case(render_trigger_position)0:screen_character="0";1:screen_character="5";2:screen_character="0";3:screen_character="5";endcase else if(p==6)screen_character="%";end
-                else if(column>=15 && column<23)begin p=column-15;if(p==0)screen_character="A";else if(p==1)screen_character="V";else if(p==2)screen_character="G";else if(p==4)case(render_average_mode)0:screen_character="1";1:screen_character="4";2:screen_character="1";3:screen_character="6";endcase else if(p==5 && render_average_mode==2)screen_character="6";else if(p==5 && render_average_mode==3)screen_character="4";end
-                else if(column>=25 && column<34)begin p=column-25;if(p==0)screen_character="S";else if(p==1)screen_character="T";else if(p==2)screen_character="A";else if(p==3)screen_character="B";else if(p==5)screen_character=render_stabilize_enable?"O":"O";else if(p==6)screen_character=render_stabilize_enable?"N":"F";else if(p==7&&!render_stabilize_enable)screen_character="F";end
-                else if(column>=36 && column<47)begin p=column-36;if(p==0)screen_character="S";else if(p==1)screen_character="I";else if(p==2)screen_character="N";else if(p==3)screen_character="G";else if(p==5)screen_character=render_single_shot?"O":"O";else if(p==6)screen_character=render_single_shot?"N":"F";else if(p==7&&!render_single_shot)screen_character="F";end
-                else if(column>=49 && column<59)begin p=column-49;if(p==0)screen_character="A";else if(p==1)screen_character="D";else if(p==2)screen_character="C";else if(p==4)screen_character=hex_digit(display_adc_bcd[15:12]);else if(p==5)screen_character=hex_digit(display_adc_bcd[11:8]);else if(p==6)screen_character=hex_digit(display_adc_bcd[7:4]);else if(p==7)screen_character=hex_digit(display_adc_bcd[3:0]);end
-                else if(column>=60 && column<69)begin p=column-60;if(p==0)screen_character="G";else if(p==1)screen_character="R";else if(p==2)screen_character="I";else if(p==3)screen_character="D";else if(p==5)screen_character=render_grid_enable?"O":"O";else if(p==6)screen_character=render_grid_enable?"N":"F";else if(p==7&&!render_grid_enable)screen_character="F";end
-            end else if (column >= 80) begin
-                p = column - 64;
-                case(line)
-                    3:case(p)0:screen_character="I";1:screen_character="N";2:screen_character="P";3:screen_character="U";4:screen_character="T";endcase
-                    4: begin if(p==0)screen_character="F";else if(p==1)screen_character="O";else if(p==2)screen_character="C";else if(p==3)screen_character="U";else if(p==4)screen_character="S";else if(p==6)screen_character="C";else if(p==7)screen_character="H";else if(p==8)screen_character="0"+render_channel;end
-                    5:case(p)0:screen_character="M";1:screen_character="E";2:screen_character="A";3:screen_character="S";4:screen_character="U";5:screen_character="R";6:screen_character="E";endcase
-                    6: begin if(p==0)screen_character="N";else if(p==1)screen_character="O";else if(p==2)screen_character="W";else if(p==4)screen_character=hex_digit(display_now_bcd[15:12]);else if(p==5)screen_character=".";else if(p==6)screen_character=hex_digit(display_now_bcd[11:8]);else if(p==7)screen_character=hex_digit(display_now_bcd[7:4]);else if(p==8)screen_character=hex_digit(display_now_bcd[3:0]);else if(p==9)screen_character="V";end
-                    8: begin if(p==0)screen_character="M";else if(p==1)screen_character="I";else if(p==2)screen_character="N";else if(p==4)screen_character=hex_digit(display_min_bcd[15:12]);else if(p==5)screen_character=".";else if(p==6)screen_character=hex_digit(display_min_bcd[11:8]);else if(p==7)screen_character=hex_digit(display_min_bcd[7:4]);else if(p==8)screen_character=hex_digit(display_min_bcd[3:0]);else if(p==9)screen_character="V";end
-                    10:begin if(p==0)screen_character="M";else if(p==1)screen_character="A";else if(p==2)screen_character="X";else if(p==4)screen_character=hex_digit(display_max_bcd[15:12]);else if(p==5)screen_character=".";else if(p==6)screen_character=hex_digit(display_max_bcd[11:8]);else if(p==7)screen_character=hex_digit(display_max_bcd[7:4]);else if(p==8)screen_character=hex_digit(display_max_bcd[3:0]);else if(p==9)screen_character="V";end
-                    12:begin if(p==0)screen_character="P";else if(p==1)screen_character="-";else if(p==2)screen_character="P";else if(p==4)screen_character=hex_digit(display_pp_bcd[15:12]);else if(p==5)screen_character=".";else if(p==6)screen_character=hex_digit(display_pp_bcd[11:8]);else if(p==7)screen_character=hex_digit(display_pp_bcd[7:4]);else if(p==8)screen_character=hex_digit(display_pp_bcd[3:0]);else if(p==9)screen_character="V";end
-                    14:begin if(p==0)screen_character="A";else if(p==1)screen_character="V";else if(p==2)screen_character="G";else if(p==4)screen_character=hex_digit(display_avg_bcd[15:12]);else if(p==5)screen_character=".";else if(p==6)screen_character=hex_digit(display_avg_bcd[11:8]);else if(p==7)screen_character=hex_digit(display_avg_bcd[7:4]);else if(p==8)screen_character=hex_digit(display_avg_bcd[3:0]);else if(p==9)screen_character="V";end
-                    16:begin if(p==0)screen_character="A";else if(p==1)screen_character="D";else if(p==2)screen_character="C";else if(p==4)screen_character=hex_digit(latest_sample[11:8]);else if(p==5)screen_character=hex_digit(latest_sample[7:4]);else if(p==6)screen_character=hex_digit(latest_sample[3:0]);end
-                    17:begin
-                        if(p==0)screen_character="F";else if(p==1)screen_character="I";else if(p==2)screen_character="L";else if(p==3)screen_character="T";
-                        else if(p==5)case(render_average_mode)0:screen_character="1";1:screen_character="4";2:screen_character="1";3:screen_character="6";endcase
-                        else if(p==6 && render_average_mode==2)screen_character="6";
-                        else if(p==6 && render_average_mode==3)screen_character="4";
-                    end
-                    18:case(p)0:screen_character="H";1:screen_character="O";2:screen_character="R";3:screen_character="I";4:screen_character="Z";5:screen_character="O";6:screen_character="N";7:screen_character="T";8:screen_character="A";9:screen_character="L";endcase
-                    19:case(p)0:screen_character="T";1:screen_character="I";2:screen_character="M";3:screen_character="E";4:screen_character="/";5:screen_character="D";6:screen_character="I";7:screen_character="V";endcase
-                    21:begin
-                        if(render_time_div_us < 1000) begin
-                            if(p==0 && render_time_div_us>=100)screen_character=hex_digit(display_time_bcd[11:8]);
-                            else if(p==1 && render_time_div_us>=10)screen_character=hex_digit(display_time_bcd[7:4]);
-                            else if(p==2)screen_character=hex_digit(display_time_bcd[3:0]);
-                            else if(p==3)screen_character="U";else if(p==4)screen_character="S";else if(p==5)screen_character="/";else if(p==6)screen_character="D";
-                        end else if(render_time_div_us < 10000) begin
-                            if(p==0)screen_character=hex_digit(display_time_bcd[15:12]);
-                            else if(p==1)screen_character=".";else if(p==2)screen_character=hex_digit(display_time_bcd[11:8]);else if(p==3)screen_character=hex_digit(display_time_bcd[7:4]);
-                            else if(p==4)screen_character="M";else if(p==5)screen_character="S";else if(p==6)screen_character="/";else if(p==7)screen_character="D";
-                        end else if(render_time_div_us < 100000) begin
-                            if(p==0)screen_character=hex_digit(display_time_bcd[19:16]);else if(p==1)screen_character=hex_digit(display_time_bcd[15:12]);else if(p==2)screen_character=".";else if(p==3)screen_character=hex_digit(display_time_bcd[11:8]);
-                            else if(p==4)screen_character="M";else if(p==5)screen_character="S";else if(p==6)screen_character="/";else if(p==7)screen_character="D";
-                        end else if(render_time_div_us < 1000000) begin
-                            if(p==0)screen_character=hex_digit(display_time_bcd[23:20]);else if(p==1)screen_character=hex_digit(display_time_bcd[19:16]);else if(p==2)screen_character=hex_digit(display_time_bcd[15:12]);else if(p==3)screen_character=".";else if(p==4)screen_character=hex_digit(display_time_bcd[11:8]);
-                            else if(p==5)screen_character="M";else if(p==6)screen_character="S";else if(p==7)screen_character="/";else if(p==8)screen_character="D";
-                        end else if(render_time_div_us < 10000000) begin
-                            if(p==0)screen_character=hex_digit(display_time_bcd[27:24]);else if(p==1)screen_character=".";else if(p==2)screen_character=hex_digit(display_time_bcd[23:20]);else if(p==3)screen_character=hex_digit(display_time_bcd[19:16]);
-                            else if(p==4)screen_character="S";else if(p==5)screen_character="/";else if(p==6)screen_character="D";
-                        end else begin
-                            if(p==0)screen_character=hex_digit(display_time_bcd[31:28]);else if(p==1)screen_character=hex_digit(display_time_bcd[27:24]);else if(p==2)screen_character=".";else if(p==3)screen_character=hex_digit(display_time_bcd[23:20]);
-                            else if(p==4)screen_character="S";else if(p==5)screen_character="/";else if(p==6)screen_character="D";
-                        end
-                    end
-                    22:case(p)0:screen_character="V";1:screen_character="E";2:screen_character="R";3:screen_character="T";4:screen_character="I";5:screen_character="C";6:screen_character="A";7:screen_character="L";endcase
-                    23:case(p)0:screen_character="V";1:screen_character="O";2:screen_character="L";3:screen_character="T";4:screen_character="/";5:screen_character="D";6:screen_character="I";7:screen_character="V";endcase
-                    25:begin
-                        if(display_vdiv_bcd[15:12]!=0) begin
-                            if(p==0)screen_character=hex_digit(display_vdiv_bcd[15:12]);else if(p==1)screen_character=".";else if(p==2)screen_character=hex_digit(display_vdiv_bcd[11:8]);else if(p==3)screen_character=hex_digit(display_vdiv_bcd[7:4]);else if(p==4)screen_character="V";else if(p==5)screen_character="/";else if(p==6)screen_character="D";
-                        end else begin
-                            if(p==0 && display_vdiv_bcd[11:8]!=0)screen_character=hex_digit(display_vdiv_bcd[11:8]);else if(p==1 && display_vdiv_bcd[11:4]!=0)screen_character=hex_digit(display_vdiv_bcd[7:4]);else if(p==2)screen_character=hex_digit(display_vdiv_bcd[3:0]);else if(p==3)screen_character="M";else if(p==4)screen_character="V";else if(p==5)screen_character="/";else if(p==6)screen_character="D";
-                        end
-                    end
-                    27:case(p)0:screen_character="T";1:screen_character="R";2:screen_character="I";3:screen_character="G";4:screen_character="G";5:screen_character="E";6:screen_character="R";endcase
-                    29:if(render_trigger_mode==0)case(p)0:screen_character="F";1:screen_character="R";2:screen_character="E";3:screen_character="E";endcase
-                       else if(render_trigger_mode==1)case(p)0:screen_character="R";1:screen_character="I";2:screen_character="S";3:screen_character="E";endcase
-                       else if(render_trigger_mode==2)case(p)0:screen_character="F";1:screen_character="A";2:screen_character="L";3:screen_character="L";endcase
-                       else case(p)0:screen_character="A";1:screen_character="U";2:screen_character="T";3:screen_character="O";endcase
-                    31:begin if(p==0)screen_character="L";else if(p==1)screen_character="V";else if(p==2)screen_character="L";else if(p==4)screen_character=hex_digit(display_level_bcd[15:12]);else if(p==5)screen_character=".";else if(p==6)screen_character=hex_digit(display_level_bcd[11:8]);else if(p==7)screen_character=hex_digit(display_level_bcd[7:4]);else if(p==8)screen_character=hex_digit(display_level_bcd[3:0]);else if(p==9)screen_character="V";end
-                    32:begin
-                        if(p==0)screen_character="P";else if(p==1)screen_character="O";else if(p==2)screen_character="S";
-                        else if(p==4)case(render_trigger_position)0:screen_character="1";1:screen_character="2";2:screen_character="5";3:screen_character="7";endcase
-                        else if(p==5)case(render_trigger_position)0:screen_character="0";1:screen_character="5";2:screen_character="0";3:screen_character="5";endcase
-                        else if(p==6)screen_character="%";
-                    end
-                    34:case(p)0:screen_character="A";1:screen_character="C";2:screen_character="Q";3:screen_character="U";4:screen_character="I";5:screen_character="R";6:screen_character="E";endcase
-                    36:if(!render_run_enable)case(p)0:screen_character="H";1:screen_character="O";2:screen_character="L";3:screen_character="D";endcase
-                       else if(render_single_shot && capture_frozen)case(p)0:screen_character="S";1:screen_character="I";2:screen_character="N";3:screen_character="G";4:screen_character="L";5:screen_character="E";endcase
-                       else if(render_single_shot)case(p)0:screen_character="S";1:screen_character="-";2:screen_character="A";3:screen_character="R";4:screen_character="M";endcase
-                       else if(capture_frozen)case(p)0:screen_character="C";1:screen_character="A";2:screen_character="P";3:screen_character="T";4:screen_character="U";5:screen_character="R";6:screen_character="E";endcase
-                       else case(p)0:screen_character="A";1:screen_character="R";2:screen_character="M";3:screen_character="E";4:screen_character="D";endcase
-                    38:begin
-                        if(p==0)screen_character="S";else if(p==1)screen_character="T";else if(p==2)screen_character="A";else if(p==3)screen_character="B";
-                        else if(p==5 && render_stabilize_enable)screen_character="O";else if(p==6 && render_stabilize_enable)screen_character="N";
-                        else if(p==5)screen_character="O";else if(p==6)screen_character="F";else if(p==7)screen_character="F";
-                    end
-                    default: screen_character=" ";
-                endcase
             end else if (column < 5 && line == 5) begin
                 screen_character = voltage_tick_character(display_axis_top_bcd, column[2:0]);
             end else if (column < 5 && line == 15) begin
@@ -1127,6 +1100,10 @@ module scope_vga (
     integer trace_index;
     integer pipeline_index;
     integer char_x, char_y;
+    reg [6:0] header_x, metric_x;
+    reg [2:0] metric_index;
+    reg [15:0] metric_bcd;
+    reg header_text;
 
     function [11:0] trace_color;
         input [2:0] selected;
@@ -1169,20 +1146,76 @@ module scope_vga (
         char_x = h_display[2:0];
         char_y = v_display[2:0];
         character = screen_character(h_display[9:3], v_display[9:3]);
+        header_text = 1'b0; header_x = 0; metric_x = 0; metric_index = 0; metric_bcd = 0;
+        if (h_display >= 8 && h_display < 624 && v_display < 38) begin
+            if(h_display<112)begin legend_channel=0;header_x=h_display-8;end
+            else if(h_display<216)begin legend_channel=1;header_x=h_display-112;end
+            else if(h_display<320)begin legend_channel=2;header_x=h_display-216;end
+            else if(h_display<424)begin legend_channel=3;header_x=h_display-320;end
+            else if(h_display<528)begin legend_channel=4;header_x=h_display-424;end
+            else begin legend_channel=5;header_x=h_display-528;end
+            character = " ";
+            char_x = header_x[3:1];
+            char_y = 7;
+            if(v_display>=2 && v_display<16) begin
+                char_y = (v_display-2) >> 1;
+                case(header_x[6:4])
+                    0: character = render_channel==legend_channel ? ">" : " ";
+                    1: character = "C"; 2: character = "H";
+                    3: character = "0" + legend_channel;
+                    default: character = " ";
+                endcase
+            end else if(v_display>=22 && v_display<36) begin
+                char_y = (v_display-22) >> 1;
+                if(!render_channel_mask[legend_channel]) begin
+                    if(header_x[6:4]<4)character="-";
+                end else case(header_x[6:4])
+                    0:character=hex_digit(channel_voltage_bcd[legend_channel][15:12]);
+                    1:character=".";
+                    2:character=hex_digit(channel_voltage_bcd[legend_channel][11:8]);
+                    3:character=hex_digit(channel_voltage_bcd[legend_channel][7:4]);
+                    5:character="V";
+                    default:character=" ";
+                endcase
+            end
+            header_text = header_x < 96;
+            if(!header_text)character=" ";
+        end else if(h_display>=40 && h_display<600 && v_display>=424 && v_display<456) begin
+            if(h_display<152)begin metric_index=0;metric_x=h_display-40;metric_bcd=display_now_bcd;end
+            else if(h_display<264)begin metric_index=1;metric_x=h_display-152;metric_bcd=display_min_bcd;end
+            else if(h_display<376)begin metric_index=2;metric_x=h_display-264;metric_bcd=display_max_bcd;end
+            else if(h_display<488)begin metric_index=3;metric_x=h_display-376;metric_bcd=display_pp_bcd;end
+            else begin metric_index=4;metric_x=h_display-488;metric_bcd=display_avg_bcd;end
+            character=" ";char_y=7;
+            if(v_display<431) begin
+                char_x=metric_x[2:0];char_y=v_display-424;
+                case(metric_index)
+                    0:case(metric_x[6:3])0:character="N";1:character="O";2:character="W";default:character=" ";endcase
+                    1:case(metric_x[6:3])0:character="M";1:character="I";2:character="N";default:character=" ";endcase
+                    2:case(metric_x[6:3])0:character="M";1:character="A";2:character="X";default:character=" ";endcase
+                    3:case(metric_x[6:3])0:character="P";1:character="-";2:character="P";default:character=" ";endcase
+                    4:case(metric_x[6:3])0:character="A";1:character="V";2:character="G";default:character=" ";endcase
+                    default:character=" ";
+                endcase
+            end else if(v_display>=442) begin
+                char_x=metric_x[3:1];char_y=(v_display-442)>>1;
+                case(metric_x[6:4])
+                    0:character=hex_digit(metric_bcd[15:12]);1:character=".";
+                    2:character=hex_digit(metric_bcd[11:8]);3:character=hex_digit(metric_bcd[7:4]);
+                    5:character="V";default:character=" ";
+                endcase
+            end
+        end
         glyph_bits = glyph(character, char_y[2:0]);
         if (char_x >= 1 && char_x <= 5 && char_y < 7)
             text_pixel = glyph_bits[5-char_x];
 
         status_rule_pixel = v_display >= 396 && h_display >= 32 && h_display <= 623 &&
-            (v_display == 396 || v_display == 419 || v_display == 443 ||
-             v_display == 467 || v_display == 479 ||
+            (v_display == 396 || v_display == 419 || v_display == 467 ||
              (v_display < 419 && (h_display == 72 || h_display == 144 ||
               h_display == 256 || h_display == 368 || h_display == 472)) ||
-             (v_display > 419 && v_display < 443 && (h_display == 144 ||
-              h_display == 256 || h_display == 368 || h_display == 480)) ||
-             (v_display > 443 && v_display < 467 && (h_display == 112 ||
-              h_display == 192 || h_display == 280 || h_display == 384 ||
-              h_display == 472 || h_display == 552)));
+             (v_display > 419 && v_display < 467 && (h_display == 144 ||
+              h_display == 256 || h_display == 368 || h_display == 480)));
 
         if (h_display >= PLOT_LEFT && h_display <= PLOT_RIGHT &&
             v_display >= PLOT_TOP && v_display <= PLOT_BOTTOM) begin
@@ -1283,8 +1316,8 @@ module scope_vga (
                       h_display==270 || h_display==328 || h_display==385 || h_display==443 ||
                       h_display==500 || h_display==558 || h_display==615)) begin
             red_next=4'h2;green_next=4'h7;blue_next=4'h8;
-        end else if (v_display < 32) begin
-            red_next=4'h0;green_next=4'h3;blue_next=4'h5;
+        end else if (v_display < 38) begin
+            red_next=4'h0;green_next=4'h2;blue_next=4'h3;
         end else if (v_display >= 396) begin
             red_next=4'h0;green_next=4'h2;blue_next=4'h3;
         end
@@ -1292,13 +1325,7 @@ module scope_vga (
             red_next=4'h1;green_next=4'h6;blue_next=4'h7;
         end
         if (text_pixel) begin
-            if (v_display[9:3] == 3 && h_display >= 16 && h_display < 592) begin
-                if (h_display < 112) legend_channel=3'd0;
-                else if (h_display < 208) legend_channel=3'd1;
-                else if (h_display < 304) legend_channel=3'd2;
-                else if (h_display < 400) legend_channel=3'd3;
-                else if (h_display < 496) legend_channel=3'd4;
-                else legend_channel=3'd5;
+            if (header_text) begin
                 if (render_channel_mask[legend_channel]) begin
                     {red_next, green_next, blue_next} = trace_color(legend_channel);
                 end else begin

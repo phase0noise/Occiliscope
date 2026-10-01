@@ -74,6 +74,7 @@ begin
             rx_valid => rx_valid,
             rx_frame_error => rx_error,
             legacy_busy => legacy_busy,
+            rx_busy => open,
             sample_data => sample_data,
             sample_strobe => sample_strobe,
             sample_channel => sample_channel,
@@ -131,7 +132,8 @@ begin
         procedure consume_packet(
             expected_type : std_logic_vector(7 downto 0);
             expected_block : integer;
-            check_trigger_sample : boolean := false) is
+            check_trigger_sample : boolean := false;
+            expected_version : std_logic_vector(7 downto 0) := x"01") is
             variable crc : unsigned(15 downto 0) := x"FFFF";
             variable received_crc : std_logic_vector(15 downto 0);
             variable trigger_hi : integer := 0;
@@ -147,7 +149,7 @@ begin
                     assert tx_data = x"D6" report "bad D6 packet magic"
                         severity failure;
                 elsif index = 1 then
-                    assert tx_data = x"01" report "bad protocol version"
+                    assert tx_data = expected_version report "bad protocol version"
                         severity failure;
                 elsif index = 2 then
                     assert tx_data = expected_type report "unexpected packet type"
@@ -161,7 +163,7 @@ begin
                 elsif check_trigger_sample and index = 34 + 16 * 6 then
                     trigger_hi := to_integer(unsigned(tx_data));
                 elsif check_trigger_sample and index = 34 + 16 * 6 + 1 then
-                    assert trigger_hi * 16 + to_integer(unsigned(tx_data)) = 1005
+                    assert trigger_hi * 256 + to_integer(unsigned(tx_data)) = 1005
                         report "slow-ramp trigger sample was not at trigger_index"
                         severity failure;
                 end if;
@@ -243,11 +245,11 @@ begin
 
         -- A VGA snapshot keeps the deep-capture memory available but records
         -- a short stream at the selected VGA decimation. X4 therefore accepts
-        -- one of every four focus samples and returns one 32-record block.
+        -- a mean/min/max column per four focus samples, in two v2 packets.
         trigger_mode <= "00";
         timebase <= "0010";
         send_command(x"05", x"5678");
-        consume_packet(x"01", 0);
+        consume_packet(x"01", 0, false, x"02");
         for index in 0 to 229 loop
             drive_sample(1200 + (index mod 32));
         end loop;
@@ -255,8 +257,9 @@ begin
         assert capture_complete = '1' and capture_valid = '1'
             report "decimated VGA snapshot did not complete" severity failure;
         send_command(x"02", x"5678");
-        consume_packet(x"02", 0);
-        consume_packet(x"03", 0);
+        consume_packet(x"02", 0, false, x"02");
+        consume_packet(x"02", 1, false, x"02");
+        consume_packet(x"03", 1, false, x"02");
 
         report "scope_capture_tb passed" severity note;
         wait;

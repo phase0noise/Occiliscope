@@ -13,6 +13,7 @@ namespace OcciliCapture {
 constexpr uint8_t COMMAND_MAGIC = 0xAA;
 constexpr uint8_t FRAME_MAGIC = 0xD6;
 constexpr uint8_t FRAME_VERSION = 1;
+constexpr uint8_t ENVELOPE_VERSION = 2;
 
 constexpr uint8_t FRAME_STATUS = 0x01;
 constexpr uint8_t FRAME_DATA = 0x02;
@@ -27,6 +28,9 @@ constexpr uint8_t COMMAND_VGA_SNAPSHOT = 0x05;
 
 constexpr uint16_t BLOCK_RECORDS = 32;
 constexpr uint16_t RECORD_BYTES = 6; // uint16 sample + uint32 timestamp on wire
+constexpr uint16_t ENVELOPE_RECORD_BYTES = 10;
+constexpr uint16_t ENVELOPE_BLOCK_RECORDS = 19;
+constexpr uint16_t MAX_SNAPSHOT_RECORDS = 640;
 constexpr uint16_t MAX_RECORDS = 8192;
 constexpr uint16_t HEADER_BYTES = 34;
 constexpr uint16_t DATA_BYTES = BLOCK_RECORDS * RECORD_BYTES;
@@ -80,6 +84,22 @@ inline void writeU32LE(uint8_t* p, uint32_t value) {
   p[3] = static_cast<uint8_t>(value >> 24);
 }
 
+// Both wire formats start with mean ADC and timestamp. Snapshot v2 adds
+// the lowest and highest ADC codes observed within that time column.
+inline bool copyRecord(const uint8_t* wire, uint8_t* artifact, bool envelope) {
+  const uint16_t mean = readU16BE(wire);
+  const uint16_t low = envelope ? readU16BE(wire + 6) : mean;
+  const uint16_t high = envelope ? readU16BE(wire + 8) : mean;
+  if (mean > 4095 || low > mean || high < mean || high > 4095) return false;
+  writeU32LE(artifact, readU32BE(wire + 2));
+  writeU16LE(artifact + 4, mean);
+  if (envelope) {
+    writeU16LE(artifact + 6, low);
+    writeU16LE(artifact + 8, high);
+  }
+  return true;
+}
+
 // CRC-16/CCITT-FALSE, polynomial 0x1021, initial value 0xffff. D6 packet
 // CRC covers bytes 0 through 225 and is stored big endian at 226..227.
 inline uint16_t crc16(const uint8_t* data, size_t length) {
@@ -128,7 +148,7 @@ class FrameParser {
 
     const uint16_t expected = readU16BE(packet_ + CRC_OFFSET);
     const uint16_t actual = crc16(packet_, CRC_OFFSET);
-    if (packet_[1] == FRAME_VERSION && expected == actual) {
+    if ((packet_[1] == FRAME_VERSION || packet_[1] == ENVELOPE_VERSION) && expected == actual) {
       ++frames_;
       if (callback != nullptr) callback(packet_, context);
     } else {
@@ -138,12 +158,15 @@ class FrameParser {
       // complete it. The version/type check avoids locking onto D6 in data.
       uint16_t suffix = 0;
       for (uint16_t candidate = 1; candidate < FRAME_BYTES; ++candidate) {
-        const bool hasType = candidate + 1 < FRAME_BYTES;
-        const uint8_t candidateType = hasType ? packet_[candidate + 1] : 0;
+        const bool hasVersion = candidate + 1 < FRAME_BYTES;
+        const bool plausibleVersion = !hasVersion || packet_[candidate + 1] == FRAME_VERSION ||
+            packet_[candidate + 1] == ENVELOPE_VERSION;
+        const bool hasType = candidate + 2 < FRAME_BYTES;
+        const uint8_t candidateType = hasType ? packet_[candidate + 2] : 0;
         const bool plausibleType = !hasType || candidateType == FRAME_STATUS ||
             candidateType == FRAME_DATA || candidateType == FRAME_DONE ||
             candidateType == FRAME_ERROR;
-        if (packet_[candidate] == FRAME_MAGIC && plausibleType) {
+        if (packet_[candidate] == FRAME_MAGIC && plausibleVersion && plausibleType) {
           suffix = static_cast<uint16_t>(FRAME_BYTES - candidate);
           for (uint16_t index = 0; index < suffix; ++index) {
             packet_[index] = packet_[candidate + index];

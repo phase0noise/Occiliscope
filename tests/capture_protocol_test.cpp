@@ -1,4 +1,4 @@
-#include "../Arduino/SerialPassthrough22/capture_protocol.h"
+#include "../firmware/pico_scope/capture_protocol.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -118,6 +118,23 @@ int main() {
   assert(frames.size() == 3);
   parser.clearPartial();
 
-  printf("PASS: D6 CRC, D5 guard, resynchronization, and partial timeout path\n");
+  // Snapshot v2 keeps the packet length and CRC, adding min/max per column.
+  auto snapshot = makePacket(FRAME_DATA, 3, ENVELOPE_BLOCK_RECORDS);
+  snapshot[1] = ENVELOPE_VERSION;
+  writeU16BE(snapshot.data() + CRC_OFFSET, crc16(snapshot.data(), CRC_OFFSET));
+  feed(parser, snapshot, frames);
+  assert(frames.size() == 4 && frames.back().sequence == 3);
+  uint8_t wire[10] = {0x07, 0xd0, 0xff, 0xff, 0xff, 0xf0, 0x01, 0xf4, 0x0d, 0xac};
+  uint8_t artifact[10] = {};
+  assert(copyRecord(wire, artifact, true));
+  assert(readU32LE(artifact) == 0xfffffff0);
+  assert(readU16LE(artifact + 4) == 2000);
+  assert(readU16LE(artifact + 6) == 500);
+  assert(readU16LE(artifact + 8) == 3500);
+  wire[6] = 0x08; // Minimum above mean is invalid.
+  assert(!copyRecord(wire, artifact, true));
+  assert(copyRecord(wire, artifact, false));
+
+  printf("PASS: D6 v1/v2 CRC, envelopes, D5 guard, resynchronization, and timeout\n");
   return 0;
 }

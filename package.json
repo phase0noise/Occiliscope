@@ -1,0 +1,14 @@
+{
+  "name": "de10lite-oscilloscope",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Browser controls and capture decoder for a DE10-Lite oscilloscope",
+  "scripts": {
+    "test": "node --check web/capture_protocol.js && node --check web/scope.js && node --test web/tests/capture_protocol.test.js web/tests/time_controls.test.js",
+    "preview:prepare": "node tools/prepare_browser_smoke.cjs",
+    "test:browser": "node tools/prepare_browser_smoke.cjs && node tools/check_browser.cjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

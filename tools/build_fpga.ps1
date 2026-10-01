@@ -3,17 +3,6 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
-$buildRoot = Join-Path $projectRoot 'build/quartus'
-New-Item -ItemType Directory -Force -Path $buildRoot | Out-Null
-
-# Build a source snapshot so verification does not overwrite the user's
-# existing Quartus database or programming outputs in the project directory.
-Get-ChildItem -LiteralPath $projectRoot -File | Where-Object {
-    $_.Extension -in '.v', '.vhd', '.qsf', '.qpf', '.sdc'
-} | ForEach-Object {
-    Copy-Item -LiteralPath $_.FullName -Destination $buildRoot -Force
-}
-Copy-Item -LiteralPath (Join-Path $projectRoot 'adc_qsys') -Destination $buildRoot -Recurse -Force
 
 $substDrive = $null
 $locationPushed = $false
@@ -30,7 +19,7 @@ try {
         }
     }
     if ($null -eq $substDrive) { throw 'No free drive letter is available for the Quartus build.' }
-    Push-Location "${substDrive}\build\quartus"
+    Push-Location "${substDrive}\"
     $locationPushed = $true
     # Windows PowerShell turns native stderr into ErrorRecords when redirected.
     # Quartus writes diagnostics there; use its exit status to decide success.
@@ -39,7 +28,7 @@ try {
     $compileExit = $LASTEXITCODE
     $ErrorActionPreference = 'Stop'
     if ($compileExit -ne 0) { throw "Quartus compile failed ($compileExit)." }
-    Write-Host "Build reports and programming file: $buildRoot/output_files"
+    Write-Host "Programming files: $projectRoot/output_files"
 } finally {
     if ($locationPushed) { Pop-Location }
     if ($null -ne $substDrive) { & subst.exe $substDrive /d | Out-Null }

@@ -1,12 +1,10 @@
 -- Deep, triggered capture engine for the browser protocol.
 --
--- The engine deliberately consumes the already crossed/averaged focus-channel
--- sample stream used by the VGA renderer.  It therefore records the actual
--- acquisition stream visible to the instrument, rather than pretending that
--- the six sequential ADC inputs were sampled simultaneously.
+-- Records the same averaged focus-channel stream used by the VGA renderer.
+-- Snapshot columns retain the mean and extrema of each decimation interval.
 --
 -- Host command (five bytes): AA OP RID_H RID_L XOR, where XOR is the XOR of
--- the preceding four bytes.  Responses are fixed 228-byte D6/v1 packets;
+-- the preceding four bytes. Responses are fixed 228-byte D6 packets;
 -- see the header layout in the packet_byte process below.
 
 library IEEE;
@@ -27,6 +25,7 @@ entity scope_capture is
         rx_valid              : in  std_logic;
         rx_frame_error        : in  std_logic;
         legacy_busy           : in  std_logic;
+        rx_busy               : out std_logic;
 
         sample_data           : in  std_logic_vector(11 downto 0);
         sample_strobe         : in  std_logic;
@@ -53,6 +52,10 @@ entity scope_capture is
 end entity scope_capture;
 
 architecture rtl of scope_capture is
+    function envelope_depth(depth : integer) return integer is
+    begin
+        if depth < 1024 then return depth; else return 1024; end if;
+    end function;
     function clog2(value : integer) return integer is
         variable result : integer := 0;
         variable v      : integer := value - 1;
@@ -68,6 +71,14 @@ architecture rtl of scope_capture is
                             depth : integer)
         return integer is
     begin
+        if depth = 640 then
+            case position is
+                when "00" => return 58;
+                when "01" => return 144;
+                when "10" => return 288;
+                when others => return 432;
+            end case;
+        end if;
         -- These ratios match the VGA choices closely while giving the deep
         -- record a useful amount of history before the trigger.
         case position is
@@ -88,10 +99,10 @@ architecture rtl of scope_capture is
         if decimated then
             extended := shift_left(extended, to_integer(unsigned(selected_timebase)));
         end if;
-        if extended > to_unsigned(16777215, extended'length) then
-            return x"FFFFFF";
+        if extended > resize(unsigned'(x"FFFFFFFF"), extended'length) then
+            return x"FFFFFFFF";
         end if;
-        return std_logic_vector(extended(23 downto 0));
+        return std_logic_vector(extended(31 downto 0));
     end function;
 
     function crc16_step(
@@ -110,6 +121,7 @@ architecture rtl of scope_capture is
     end function;
 
     constant ADDR_WIDTH  : integer := clog2(DEPTH);
+    constant ENVELOPE_ADDR_WIDTH : integer := clog2(envelope_depth(DEPTH));
     constant BLOCK_RECORDS : integer := 32;
     constant HEADER_BYTES  : integer := 34;
     constant DATA_BYTES    : integer := BLOCK_RECORDS * 6;
@@ -119,13 +131,16 @@ architecture rtl of scope_capture is
         std_logic_vector(11 downto 0);
     type timestamp_memory_t is array (0 to DEPTH - 1) of
         std_logic_vector(31 downto 0);
+    type envelope_memory_t is array (0 to envelope_depth(DEPTH) - 1) of
+        std_logic_vector(11 downto 0);
 
-    -- Separate sample and timestamp arrays map predictably to M9Ks.  The
-    -- MAX 10 has ample unused memory for the default 8192-record build.
+    -- Separate arrays map to M9Ks. Envelopes need only the snapshot history.
     signal sample_memory : sample_memory_t
         /* synthesis ramstyle = "M9K" */;
     signal timestamp_memory : timestamp_memory_t
         /* synthesis ramstyle = "M9K" */;
+    signal minimum_memory : envelope_memory_t /* synthesis ramstyle = "M9K" */;
+    signal maximum_memory : envelope_memory_t /* synthesis ramstyle = "M9K" */;
 
     signal timestamp_counter : unsigned(31 downto 0) := (others => '0');
     signal write_pointer     : unsigned(ADDR_WIDTH - 1 downto 0) :=
@@ -142,6 +157,10 @@ architecture rtl of scope_capture is
     signal snapshot_mode     : std_logic := '0';
     signal decimation_count  : unsigned(9 downto 0) := (others => '0');
     signal decimation_limit  : unsigned(9 downto 0) := (others => '0');
+    signal column_sum : unsigned(21 downto 0) := (others => '0');
+    signal column_min : unsigned(11 downto 0) := (others => '1');
+    signal column_max : unsigned(11 downto 0) := (others => '0');
+    signal column_trigger : std_logic := '0';
     signal trigger_index     : unsigned(15 downto 0) := (others => '0');
 
     signal previous_sample   : unsigned(11 downto 0) := (others => '0');
@@ -161,7 +180,7 @@ architecture rtl of scope_capture is
     signal meta_trigger_mode : std_logic_vector(1 downto 0) := (others => '0');
     signal meta_trigger_level : std_logic_vector(11 downto 0) :=
         (others => '0');
-    signal meta_sample_period : std_logic_vector(23 downto 0) :=
+    signal meta_sample_period : std_logic_vector(31 downto 0) :=
         (others => '0');
     signal meta_full_scale   : std_logic_vector(15 downto 0) := (others => '0');
     signal meta_timestamp    : std_logic_vector(31 downto 0) := (others => '0');
@@ -192,12 +211,17 @@ architecture rtl of scope_capture is
     signal crc_bits          : integer range 0 to 8 := 0;
     signal packet_record_addr : unsigned(ADDR_WIDTH - 1 downto 0) :=
         (others => '0');
-    signal packet_record_byte : integer range 0 to 5 := 0;
+    signal packet_record_byte : integer range 0 to 9 := 0;
     signal packet_record_number : integer range 0 to BLOCK_RECORDS - 1 := 0;
     signal ram_record_sample : std_logic_vector(11 downto 0) :=
         (others => '0');
     signal ram_record_timestamp : std_logic_vector(31 downto 0) :=
         (others => '0');
+    signal ram_read_addr : unsigned(ADDR_WIDTH - 1 downto 0);
+    signal ram_record_min : std_logic_vector(11 downto 0);
+    signal ram_record_max : std_logic_vector(11 downto 0);
+    signal ram_write_min : std_logic_vector(11 downto 0) := (others => '0');
+    signal ram_write_max : std_logic_vector(11 downto 0) := (others => '0');
     signal ram_write_enable : std_logic := '0';
     signal ram_write_addr : unsigned(ADDR_WIDTH - 1 downto 0) :=
         (others => '0');
@@ -215,7 +239,7 @@ architecture rtl of scope_capture is
     signal packet_trigger_level : std_logic_vector(11 downto 0) :=
         (others => '0');
     signal packet_trigger_index : unsigned(15 downto 0) := (others => '0');
-    signal packet_sample_period : std_logic_vector(23 downto 0) :=
+    signal packet_sample_period : std_logic_vector(31 downto 0) :=
         (others => '0');
     signal packet_timestamp : std_logic_vector(31 downto 0) := (others => '0');
     signal packet_config : std_logic_vector(31 downto 0) := (others => '0');
@@ -227,6 +251,7 @@ begin
     capture_complete <= complete;
     capture_valid    <= valid_record;
     capture_invalid  <= invalid_record;
+    ram_read_addr <= packet_record_addr when packet_active = '1' else start_pointer;
 
     -- One synchronous read port and one synchronous write port map both
     -- arrays into M9Ks. UART serialization leaves thousands of clocks between
@@ -238,10 +263,16 @@ begin
                 sample_memory(to_integer(ram_write_addr)) <= ram_write_sample;
                 timestamp_memory(to_integer(ram_write_addr)) <=
                     ram_write_timestamp;
+                if snapshot_mode = '1' then
+                    minimum_memory(to_integer(ram_write_addr(ENVELOPE_ADDR_WIDTH - 1 downto 0))) <= ram_write_min;
+                    maximum_memory(to_integer(ram_write_addr(ENVELOPE_ADDR_WIDTH - 1 downto 0))) <= ram_write_max;
+                end if;
             end if;
-            ram_record_sample <= sample_memory(to_integer(packet_record_addr));
+            ram_record_sample <= sample_memory(to_integer(ram_read_addr));
             ram_record_timestamp <= timestamp_memory(
-                to_integer(packet_record_addr));
+                to_integer(ram_read_addr));
+            ram_record_min <= minimum_memory(to_integer(ram_read_addr(ENVELOPE_ADDR_WIDTH - 1 downto 0)));
+            ram_record_max <= maximum_memory(to_integer(ram_read_addr(ENVELOPE_ADDR_WIDTH - 1 downto 0)));
         end if;
     end process;
 
@@ -261,11 +292,7 @@ begin
             elsif rx_valid = '1' then
                 case command_state is
                     when 0 =>
-                        -- Legacy A6/A8 frames own the line while active.  An
-                        -- AA inside one of their payloads must not steal the
-                        -- frame; once AA owns the line, subsequent request
-                        -- bytes are accepted even though legacy_busy rises
-                        -- after the first byte is discarded by the old parser.
+                        -- A byte inside a settings frame cannot start a capture.
                         if legacy_busy = '0' and rx_byte = x"AA" then
                             command_xor   <= x"AA";
                             command_state <= 1;
@@ -312,6 +339,12 @@ begin
         variable event_op : std_logic_vector(7 downto 0);
         variable event_id : std_logic_vector(15 downto 0);
         variable block_count : integer;
+        variable records_per_block : integer range 19 to 32;
+        variable record_size : integer range 6 to 10;
+        variable sum_with_sample : unsigned(21 downto 0);
+        variable mean_sample : unsigned(21 downto 0);
+        variable minimum_sample : unsigned(11 downto 0);
+        variable maximum_sample : unsigned(11 downto 0);
         variable next_record_addr : unsigned(ADDR_WIDTH - 1 downto 0);
         variable next_crc_bit : unsigned(15 downto 0);
         variable arm_depth : integer range 1 to DEPTH;
@@ -331,6 +364,10 @@ begin
                 snapshot_mode <= '0';
                 decimation_count <= (others => '0');
                 decimation_limit <= (others => '0');
+                column_sum <= (others => '0');
+                column_min <= (others => '1');
+                column_max <= (others => '0');
+                column_trigger <= '0';
                 trigger_index <= (others => '0');
                 previous_sample <= (others => '0');
                 previous_valid <= '0';
@@ -383,11 +420,12 @@ begin
                 packet_config <= (others => '0');
                 packet_full_scale <= (others => '0');
             else
+                if snapshot_mode = '1' then records_per_block := 19; record_size := 10;
+                else records_per_block := 32; record_size := 6; end if;
                 ram_write_enable <= '0';
                 timestamp_counter <= timestamp_counter + 1;
-                -- Compute one CRC bit per clock. UART bytes are thousands of
-                -- clocks apart, so this removes the former eight-stage XOR
-                -- chain from the 50 MHz critical path without affecting data.
+                -- One CRC bit per clock keeps the XOR chain off the critical
+                -- path. UART byte acceptance leaves time for all eight bits.
                 if crc_bits /= 0 then
                     if crc_work(15) = '1' then
                         next_crc_bit := (crc_work(14 downto 0) & '0') xor x"1021";
@@ -462,6 +500,10 @@ begin
                             decimation_limit <= (others => '0');
                         end if;
                         decimation_count <= (others => '0');
+                        column_sum <= (others => '0');
+                        column_min <= (others => '1');
+                        column_max <= (others => '0');
+                        column_trigger <= '0';
                         running <= '1';
                         complete <= '0';
                         valid_record <= '0';
@@ -499,11 +541,12 @@ begin
                             packet_type <= x"02";
                             packet_index <= 0;
                             packet_block <= 0;
-                            block_count := (record_count + BLOCK_RECORDS - 1) /
-                                           BLOCK_RECORDS;
+                            if snapshot_mode = '1' then
+                                block_count := (SNAPSHOT_DEPTH + 18) / 19;
+                            else block_count := (record_count + 31) / 32; end if;
                             packet_blocks <= block_count;
-                            if record_count >= BLOCK_RECORDS then
-                                packet_block_records <= BLOCK_RECORDS;
+                            if record_count >= records_per_block then
+                                packet_block_records <= records_per_block;
                             else
                                 packet_block_records <= record_count;
                             end if;
@@ -520,7 +563,7 @@ begin
                             packet_trigger_level <= meta_trigger_level;
                             packet_trigger_index <= trigger_index;
                             packet_sample_period <= meta_sample_period;
-                            packet_timestamp <= meta_timestamp;
+                            packet_timestamp <= ram_record_timestamp;
                             packet_config <= latched_config;
                             packet_full_scale <= meta_full_scale;
                             packet_crc <= x"FFFF";
@@ -544,7 +587,7 @@ begin
                         packet_trigger_level <= meta_trigger_level;
                         packet_trigger_index <= trigger_index;
                         packet_sample_period <= meta_sample_period;
-                        packet_timestamp <= meta_timestamp;
+                        packet_timestamp <= ram_record_timestamp;
                         packet_config <= latched_config;
                         packet_full_scale <= meta_full_scale;
                         packet_block_records <= 0;
@@ -575,7 +618,7 @@ begin
                         packet_trigger_level <= meta_trigger_level;
                         packet_trigger_index <= trigger_index;
                         packet_sample_period <= meta_sample_period;
-                        packet_timestamp <= meta_timestamp;
+                        packet_timestamp <= ram_record_timestamp;
                         packet_config <= latched_config;
                         packet_full_scale <= meta_full_scale;
                         packet_block_records <= 0;
@@ -592,12 +635,49 @@ begin
                     if settle_count /= 0 then
                         settle_count <= settle_count - 1;
                         decimation_count <= (others => '0');
+                        column_sum <= (others => '0');
+                        column_min <= (others => '1');
+                        column_max <= (others => '0');
+                        column_trigger <= '0';
                         previous_valid <= '0';
                         trigger_ready <= '0';
                     elsif decimation_count /= decimation_limit then
                         decimation_count <= decimation_count + 1;
+                        column_sum <= column_sum + resize(unsigned(sample_data), 22);
+                        if unsigned(sample_data) < column_min then column_min <= unsigned(sample_data); end if;
+                        if unsigned(sample_data) > column_max then column_max <= unsigned(sample_data); end if;
+                        -- Detect narrow edges before decimation. Keep the
+                        -- crossing until its column is committed to memory.
+                        if triggered = '0' and sample_count >= pretrigger_count then
+                            sample_integer := to_integer(unsigned(sample_data));
+                            lower_level := to_integer(unsigned(trigger_level));
+                            upper_level := lower_level;
+                            if lower_level > 4 then lower_level := lower_level - 4; else lower_level := 0; end if;
+                            if upper_level < 4091 then upper_level := upper_level + 4; else upper_level := 4095; end if;
+                            if trigger_mode = "01" or trigger_mode = "11" then
+                                if sample_integer <= lower_level then trigger_ready <= '1';
+                                elsif trigger_ready = '1' and sample_integer >= upper_level then
+                                    column_trigger <= '1'; trigger_ready <= '0';
+                                end if;
+                            elsif trigger_mode = "10" then
+                                if sample_integer >= upper_level then trigger_ready <= '1';
+                                elsif trigger_ready = '1' and sample_integer <= lower_level then
+                                    column_trigger <= '1'; trigger_ready <= '0';
+                                end if;
+                            end if;
+                        end if;
                     else
                         decimation_count <= (others => '0');
+                        sum_with_sample := column_sum + resize(unsigned(sample_data), 22);
+                        mean_sample := shift_right(sum_with_sample, to_integer(unsigned(timebase)));
+                        minimum_sample := column_min;
+                        maximum_sample := column_max;
+                        if unsigned(sample_data) < minimum_sample then minimum_sample := unsigned(sample_data); end if;
+                        if unsigned(sample_data) > maximum_sample then maximum_sample := unsigned(sample_data); end if;
+                        column_sum <= (others => '0');
+                        column_min <= (others => '1');
+                        column_max <= (others => '0');
+                        column_trigger <= '0';
                         -- The ADC/averager settings have propagated through
                         -- their crossing by this point; retain the measured
                         -- interval metadata from the settled stream rather
@@ -606,7 +686,11 @@ begin
                                                          snapshot_mode = '1');
                         ram_write_enable <= '1';
                         ram_write_addr <= write_pointer;
-                        ram_write_sample <= sample_data;
+                        if snapshot_mode = '1' then
+                            ram_write_sample <= std_logic_vector(mean_sample(11 downto 0));
+                        else ram_write_sample <= sample_data; end if;
+                        ram_write_min <= std_logic_vector(minimum_sample);
+                        ram_write_max <= std_logic_vector(maximum_sample);
                         ram_write_timestamp <= std_logic_vector(timestamp_counter);
                         next_pointer := write_pointer + 1;
                         write_pointer <= next_pointer;
@@ -665,12 +749,14 @@ begin
                             end if;
                         end if;
 
+                        if triggered = '0' and column_trigger = '1' then hit := true; end if;
+
                         if hit then
                             triggered <= '1';
                             trigger_index <= to_unsigned(pretrigger_count, 16);
                             post_remaining <= active_depth - pretrigger_count - 1;
                             candidate_start := next_pointer -
-                                               to_unsigned(pretrigger_count,
+                                               to_unsigned(pretrigger_count + 1,
                                                            ADDR_WIDTH);
                             if active_depth - pretrigger_count - 1 = 0 then
                                 running <= '0';
@@ -688,7 +774,7 @@ begin
                                 valid_record <= '1';
                                 invalid_record <= '0';
                                 record_count <= active_depth;
-                                start_pointer <= next_pointer;
+                                start_pointer <= next_pointer - to_unsigned(active_depth - 1, ADDR_WIDTH) - 1;
                                 meta_timestamp <= (others => '0');
                                 post_remaining <= 0;
                             else
@@ -717,18 +803,18 @@ begin
                             packet_index <= 0;
                             packet_crc <= x"FFFF";
                             next_record_addr := start_pointer + to_unsigned(
-                                (packet_block + 1) * BLOCK_RECORDS,
+                                (packet_block + 1) * records_per_block,
                                 ADDR_WIDTH);
                             packet_record_addr <= next_record_addr;
                             packet_record_byte <= 0;
                             packet_record_number <= 0;
                             if packet_total_count -
-                               (packet_block + 1) * BLOCK_RECORDS <
-                               BLOCK_RECORDS then
+                               (packet_block + 1) * records_per_block <
+                               records_per_block then
                                 packet_block_records <= packet_total_count -
-                                    (packet_block + 1) * BLOCK_RECORDS;
+                                    (packet_block + 1) * records_per_block;
                             else
-                                packet_block_records <= BLOCK_RECORDS;
+                                packet_block_records <= records_per_block;
                             end if;
                         elsif packet_type = x"02" then
                             -- A final DONE packet makes the end of a download
@@ -747,7 +833,7 @@ begin
                         if packet_type = x"02" and
                            packet_index >= HEADER_BYTES and
                            packet_index < HEADER_BYTES + DATA_BYTES then
-                            if packet_record_byte = 5 then
+                            if packet_record_byte = record_size - 1 then
                                 packet_record_byte <= 0;
                                 if packet_record_number < BLOCK_RECORDS - 1 then
                                     packet_record_number <= packet_record_number + 1;
@@ -777,15 +863,17 @@ begin
         byte_value := (others => '0');
         case packet_index is
             when 0  => byte_value := x"D6";
-            when 1  => byte_value := x"01";
+            when 1  =>
+                if snapshot_mode = '1' then byte_value := x"02";
+                else byte_value := x"01"; end if;
             when 2  => byte_value := packet_type;
             when 3  => byte_value := packet_flags;
             when 4  => byte_value := packet_request_id(15 downto 8);
             when 5  => byte_value := packet_request_id(7 downto 0);
             when 6  => byte_value := packet_capture_id(15 downto 8);
             when 7  => byte_value := packet_capture_id(7 downto 0);
-            when 8  => byte_value := std_logic_vector(to_unsigned(packet_block, 8));
-            when 9  => byte_value := x"00";
+            when 8  => byte_value := x"00";
+            when 9  => byte_value := std_logic_vector(to_unsigned(packet_block, 8));
             when 10 => byte_value := std_logic_vector(to_unsigned(
                                   packet_total_count / 256, 8));
             when 11 => byte_value := std_logic_vector(to_unsigned(
@@ -812,12 +900,19 @@ begin
             when 30 => byte_value := packet_config(7 downto 0);
             when 31 => byte_value := packet_full_scale(15 downto 8);
             when 32 => byte_value := packet_full_scale(7 downto 0);
-            when 33 => byte_value := x"00";
+            when 33 =>
+                if snapshot_mode = '1' then byte_value := packet_sample_period(31 downto 24);
+                else byte_value := x"00"; end if;
             when others =>
                 if packet_index < HEADER_BYTES + DATA_BYTES then
                     data_index := packet_index - HEADER_BYTES;
-                    record_index := data_index / 6;
-                    record_byte := data_index mod 6;
+                    if snapshot_mode = '1' then
+                        record_index := data_index / 10;
+                        record_byte := data_index mod 10;
+                    else
+                        record_index := data_index / 6;
+                        record_byte := data_index mod 6;
+                    end if;
                     if packet_type = x"02" and
                        record_index < packet_block_records then
                         case record_byte is
@@ -827,7 +922,11 @@ begin
                             when 2 => byte_value := ram_record_timestamp(31 downto 24);
                             when 3 => byte_value := ram_record_timestamp(23 downto 16);
                             when 4 => byte_value := ram_record_timestamp(15 downto 8);
-                            when others => byte_value := ram_record_timestamp(7 downto 0);
+                            when 5 => byte_value := ram_record_timestamp(7 downto 0);
+                            when 6 => byte_value := "0000" & ram_record_min(11 downto 8);
+                            when 7 => byte_value := ram_record_min(7 downto 0);
+                            when 8 => byte_value := "0000" & ram_record_max(11 downto 8);
+                            when others => byte_value := ram_record_max(7 downto 0);
                         end case;
                     else
                         byte_value := x"00";
@@ -843,4 +942,5 @@ begin
     end process;
     tx_data <= packet_byte;
     tx_valid <= packet_active;
+    rx_busy <= '1' when command_state /= 0 else '0';
 end architecture rtl;

@@ -1,11 +1,10 @@
--- Clean oscilloscope top level for the DE10-Lite.
+-- Oscilloscope top level for the DE10-Lite.
 --
 -- UART TX: D5 CH AH AL PH PM PL VALUE XOR (checked binary telemetry)
 -- UART RX: set:CCCC:FFFF:GGGG\n
 --
--- CCCC is the ADC input number (0000..0005), FFFF is VALUE (0000..0099),
--- GGGG is reserved, and AAAA is the selected 12-bit ADC sample (0000..4095).
--- Telemetry echoes VALUE in FFFF and the confirmed channel in GGGG.
+-- ASCII control: CCCC selects ADC input 0..5, FFFF sets VALUE 0..99,
+-- and GGGG is reserved. Binary control and telemetry: docs/UART_PROTOCOL.md.
 
 library IEEE;
 use IEEE.STD_LOGIC_1164.ALL;
@@ -15,6 +14,7 @@ entity oscilloscope is
     port (
         MAX10_CLK1_50 : in    std_logic;
         KEY           : in    std_logic_vector(1 downto 0);
+        SW0           : in    std_logic;
         SW8           : in    std_logic;
         SW9           : in    std_logic;
         LEDR          : out   std_logic_vector(9 downto 0);
@@ -38,7 +38,7 @@ end entity oscilloscope;
 
 architecture rtl of oscilloscope is
     constant CLOCK_FREQUENCY_HZ : integer := 50000000;
-    constant UART_BAUD_RATE     : integer := 9600;
+    constant UART_BAUD_RATE     : integer := 115200;
     constant UART_PACKET_BYTES  : integer := 9;
 
     function next_enabled_channel(
@@ -129,12 +129,17 @@ architecture rtl of oscilloscope is
             trigger_level     : in  std_logic_vector(11 downto 0);
             grid_enable       : in  std_logic;
             run_enable        : in  std_logic;
+            manual_mode       : in  std_logic;
             trigger_position  : in  std_logic_vector(1 downto 0);
             single_shot       : in  std_logic;
             average_mode      : in  std_logic_vector(1 downto 0);
             stabilize_enable  : in  std_logic;
             sample_period_cycles : in std_logic_vector(23 downto 0);
             full_scale_mv     : in  std_logic_vector(15 downto 0);
+            live_request      : in  std_logic;
+            live_tx_data      : out std_logic_vector(7 downto 0);
+            live_tx_valid     : out std_logic;
+            live_tx_pop       : in  std_logic;
             VGA_R             : out std_logic_vector(3 downto 0);
             VGA_G             : out std_logic_vector(3 downto 0);
             VGA_B             : out std_logic_vector(3 downto 0);
@@ -142,6 +147,23 @@ architecture rtl of oscilloscope is
             VGA_VS            : out std_logic
         );
         end component;
+
+    component scope_fft
+        port (
+            clk, reset, request, cancel : in std_logic;
+            requested_timebase : in std_logic_vector(3 downto 0);
+            request_id : in std_logic_vector(15 downto 0);
+            sample_data : in std_logic_vector(11 downto 0);
+            sample_strobe : in std_logic;
+            channel : in std_logic_vector(2 downto 0);
+            full_scale_mv : in std_logic_vector(15 downto 0);
+            config_fingerprint : in std_logic_vector(31 downto 0);
+            busy : out std_logic;
+            tx_data : out std_logic_vector(7 downto 0);
+            tx_valid : out std_logic;
+            tx_pop : in std_logic
+        );
+    end component;
 
     component scope_capture
         generic (
@@ -154,6 +176,7 @@ architecture rtl of oscilloscope is
             rx_valid              : in  std_logic;
             rx_frame_error        : in  std_logic;
             legacy_busy           : in  std_logic;
+            rx_busy               : out std_logic;
             sample_data           : in  std_logic_vector(11 downto 0);
             sample_strobe         : in  std_logic;
             sample_channel        : in  std_logic_vector(2 downto 0);
@@ -180,8 +203,6 @@ architecture rtl of oscilloscope is
         std_logic_vector(7 downto 0);
 
     signal reset                  : std_logic;
-    signal baud_select_meta       : std_logic := '0';
-    signal baud_select_sync       : std_logic := '0';
     signal selected_channel       : integer range 0 to 5 := 0;
     signal channel_mask           : std_logic_vector(5 downto 0) := "000001";
     signal scan_channel_adc       : integer range 0 to 5 := 0;
@@ -278,6 +299,14 @@ architecture rtl of oscilloscope is
     signal command_error          : std_logic := '0';
     signal rx_activity_count      : integer range 0 to 25000000 := 0;
 
+    signal manual_meta, manual_mode : std_logic := '0';
+    signal active_channel_mask : std_logic_vector(5 downto 0);
+    signal active_channel : integer range 0 to 5;
+    signal active_average, active_trigger : integer range 0 to 3;
+    signal active_run, active_single, active_stabilize : std_logic;
+    signal key_debounced : std_logic_vector(1 downto 0) := (others => '1');
+    type debounce_counters_t is array (0 to 1) of integer range 0 to 499999;
+    signal key_debounce_count : debounce_counters_t := (others => 0);
     signal key_meta               : std_logic_vector(1 downto 0) := (others => '1');
     signal key_sync               : std_logic_vector(1 downto 0) := (others => '1');
     signal key_previous           : std_logic_vector(1 downto 0) := (others => '1');
@@ -304,9 +333,22 @@ architecture rtl of oscilloscope is
     signal capture_tx_data        : std_logic_vector(7 downto 0) := (others => '0');
     signal capture_tx_valid       : std_logic;
     signal capture_tx_pop         : std_logic := '0';
+    signal live_request           : std_logic;
+    signal live_tx_data           : std_logic_vector(7 downto 0);
+    signal live_tx_valid          : std_logic;
+    signal live_tx_pop            : std_logic := '0';
+    signal tx_stream              : integer range 0 to 3 := 0;
+    signal fft_request, fft_cancel, fft_tx_valid, fft_tx_pop, fft_busy : std_logic := '0';
+    signal fft_tx_data, rx_fft_checksum : std_logic_vector(7 downto 0) := (others => '0');
+    signal fft_timebase : std_logic_vector(3 downto 0) := (others => '0');
+    signal fft_request_id : std_logic_vector(15 downto 0) := (others => '0');
+    signal rx_fft_state : integer range 0 to 4 := 0;
+    signal rx_fft_timebase : std_logic_vector(3 downto 0) := (others => '0');
+    signal rx_fft_id : std_logic_vector(15 downto 0) := (others => '0');
     signal capture_config_fingerprint : std_logic_vector(31 downto 0);
     signal capture_config_revision : unsigned(15 downto 0) := (others => '0');
     signal legacy_parser_busy    : std_logic;
+    signal capture_rx_busy       : std_logic;
 
     signal display_digits         : std_logic_vector(23 downto 0);
     signal voltage_mv             : hex_voltage_array_t := (others => 0);
@@ -316,6 +358,8 @@ architecture rtl of oscilloscope is
     signal vga_channel_samples    : std_logic_vector(71 downto 0);
 begin
     reset <= SW9;
+    live_request <= '1' when rx_byte_valid = '1' and rx_byte = x"AB" and
+                              legacy_parser_busy = '0' and capture_rx_busy = '0' else '0';
 
     -- Two independent synthesizable pulse generators. Configuration arrives
     -- as clock-period and high-time counts, so the FPGA datapath needs only
@@ -344,19 +388,6 @@ begin
         end if;
     end process;
 
-    baud_select_proc : process(MAX10_CLK1_50)
-    begin
-        if rising_edge(MAX10_CLK1_50) then
-            if reset = '1' then
-                baud_select_meta <= '0';
-                baud_select_sync <= '0';
-            else
-                baud_select_meta <= SW8;
-                baud_select_sync <= baud_select_meta;
-            end if;
-        end if;
-    end process;
-
     -- The six phone-visible channels 0..5 map to the MAX 10 ADC command
     -- channels 1..6, which correspond to the six DE10-Lite ADC inputs.
     adc_channel_command <= std_logic_vector(to_unsigned(scan_channel_adc + 1, 5));
@@ -364,23 +395,31 @@ begin
     -- A compact configuration fingerprint travels with a deep capture.  The
     -- capture engine compares it continuously so changing display/acquisition
     -- settings cannot leave a record that appears valid under new settings.
+    active_channel_mask <= "111111" when manual_mode = '1' else channel_mask;
+    active_channel <= 0 when manual_mode = '1' else selected_channel;
+    active_average <= 0 when manual_mode = '1' else display_average;
+    active_trigger <= 0 when manual_mode = '1' else display_trigger;
+    active_run <= '1' when manual_mode = '1' else display_run;
+    active_single <= '0' when manual_mode = '1' else display_single;
+    active_stabilize <= '0' when manual_mode = '1' else display_stabilize;
+
     capture_fingerprint_proc : process(all)
     begin
         -- The revision is bumped only when an acquisition-affecting setting
         -- commits.  The packed lower bits retain channel/mode context for
         -- diagnostics while avoiding the live measured sample period.
         capture_config_fingerprint <= std_logic_vector(capture_config_revision) &
-            channel_mask &
-            std_logic_vector(to_unsigned(selected_channel, 3)) &
-            std_logic_vector(to_unsigned(display_average, 2)) &
-            std_logic_vector(to_unsigned(display_trigger, 2)) &
+            active_channel_mask &
+            std_logic_vector(to_unsigned(active_channel, 3)) &
+            std_logic_vector(to_unsigned(active_average, 2)) &
+            std_logic_vector(to_unsigned(active_trigger, 2)) &
             std_logic_vector(to_unsigned(display_trigger_position, 2)) &
-            '0';
+            manual_mode;
     end process;
 
     legacy_parser_busy <= '1' when rx_position /= 0 or rx_discard = '1' or
                           rx_binary_state /= 0 or rx_scan_state /= 0 or
-                          rx_display_state /= 0 or rx_cal_state /= 0 or
+                          rx_display_state /= 0 or rx_cal_state /= 0 or rx_fft_state /= 0 or
                           rx_gen_state /= 0 else '0';
 
     -- Pico GP0 (TX) -> FPGA GPIO[8]; Pico GP1 (RX) <- FPGA GPIO[4].
@@ -423,9 +462,9 @@ begin
                 channel_mask_meta_adc <= "000001";
                 channel_mask_sync_adc <= "000001";
             else
-                channel_mask_meta_adc <= channel_mask;
+                channel_mask_meta_adc <= active_channel_mask;
                 channel_mask_sync_adc <= channel_mask_meta_adc;
-                adc_average_meta_adc <= std_logic_vector(to_unsigned(display_average, 2));
+                adc_average_meta_adc <= std_logic_vector(to_unsigned(active_average, 2));
                 adc_average_sync_adc <= adc_average_meta_adc;
                 case adc_average_sync_adc is
                     when "00" => target_count := 1;  shift_count := 0;
@@ -513,7 +552,7 @@ begin
                     adc_scan_channel <= std_logic_vector(to_unsigned(crossed_channel, 3));
                     adc_scan_strobe <= '1';
                     channel_samples(crossed_channel) <= crossed_sample;
-                    if crossed_channel = selected_channel then
+                    if crossed_channel = active_channel then
                         vga_sample <= crossed_sample;
                         adc_sample_strobe <= '1';
                         if adc_interval_counter /= 0 then
@@ -538,7 +577,7 @@ begin
         port map (
             clk      => MAX10_CLK1_50,
             reset    => reset,
-            high_speed => baud_select_sync,
+            high_speed => '1',
             rx       => UART_RX_PIN,
             rx_data  => rx_byte,
             rx_valid => rx_byte_valid,
@@ -559,13 +598,14 @@ begin
             rx_valid             => rx_byte_valid,
             rx_frame_error       => rx_frame_error,
             legacy_busy          => legacy_parser_busy,
+            rx_busy              => capture_rx_busy,
             sample_data          => std_logic_vector(to_unsigned(vga_sample, 12)),
             sample_strobe        => adc_sample_strobe,
-            sample_channel       => std_logic_vector(to_unsigned(selected_channel, 3)),
-            selected_channel     => std_logic_vector(to_unsigned(selected_channel, 3)),
-            average_mode         => std_logic_vector(to_unsigned(display_average, 2)),
+            sample_channel       => std_logic_vector(to_unsigned(active_channel, 3)),
+            selected_channel     => std_logic_vector(to_unsigned(active_channel, 3)),
+            average_mode         => std_logic_vector(to_unsigned(active_average, 2)),
             timebase             => std_logic_vector(to_unsigned(display_timebase, 4)),
-            trigger_mode         => std_logic_vector(to_unsigned(display_trigger, 2)),
+            trigger_mode         => std_logic_vector(to_unsigned(active_trigger, 2)),
             trigger_level        => std_logic_vector(to_unsigned(display_trigger_level, 12)),
             trigger_position     => std_logic_vector(to_unsigned(display_trigger_position, 2)),
             sample_period_cycles => std_logic_vector(adc_sample_period),
@@ -580,19 +620,46 @@ begin
             capture_invalid      => open
         );
 
-    -- Synchronize the active-low push buttons.  KEY0 advances the channel;
-    -- KEY1 moves backward, which is handy before the phone UI is connected.
+    spectrum_engine : scope_fft
+        port map (
+            clk => MAX10_CLK1_50, reset => reset,
+            request => fft_request, cancel => fft_cancel,
+            requested_timebase => fft_timebase, request_id => fft_request_id,
+            sample_data => std_logic_vector(to_unsigned(vga_sample, 12)),
+            sample_strobe => adc_sample_strobe,
+            channel => std_logic_vector(to_unsigned(active_channel, 3)),
+            full_scale_mv => std_logic_vector(to_unsigned(adc_full_scale_mv, 16)),
+            config_fingerprint => capture_config_fingerprint,
+            busy => fft_busy, tx_data => fft_tx_data,
+            tx_valid => fft_tx_valid, tx_pop => fft_tx_pop
+        );
+
+    -- Buttons settle for 10 ms before producing one edge per press.
+    -- SW0 overrides phone acquisition settings without erasing them.
     key_sync_proc : process(MAX10_CLK1_50)
     begin
         if rising_edge(MAX10_CLK1_50) then
             if reset = '1' then
-                key_meta     <= (others => '1');
-                key_sync     <= (others => '1');
+                key_meta <= (others => '1');
+                key_sync <= (others => '1');
+                key_debounced <= (others => '1');
                 key_previous <= (others => '1');
+                key_debounce_count <= (others => 0);
+                manual_meta <= '0'; manual_mode <= '0';
             else
-                key_meta     <= KEY;
-                key_sync     <= key_meta;
-                key_previous <= key_sync;
+                manual_meta <= SW0; manual_mode <= manual_meta;
+                key_meta <= KEY; key_sync <= key_meta;
+                key_previous <= key_debounced;
+                for button in 0 to 1 loop
+                    if key_sync(button) = key_debounced(button) then
+                        key_debounce_count(button) <= 0;
+                    elsif key_debounce_count(button) = 499999 then
+                        key_debounced(button) <= key_sync(button);
+                        key_debounce_count(button) <= 0;
+                    else
+                        key_debounce_count(button) <= key_debounce_count(button) + 1;
+                    end if;
+                end loop;
             end if;
         end if;
     end process;
@@ -635,6 +702,7 @@ begin
                 rx_cal_state <= 0;
                 rx_cal_high <= x"13";
                 rx_cal_low <= x"88";
+                rx_fft_state <= 0; fft_request <= '0'; fft_cancel <= '0';
                 rx_gen_state <= 0;
                 rx_gen_checksum <= (others => '0');
                 rx_gen_index <= 0;
@@ -664,6 +732,7 @@ begin
                 rx_activity_count  <= 0;
                 capture_config_revision <= (others => '0');
             else
+                fft_request <= '0'; fft_cancel <= '0';
                 if rx_activity_count > 0 then
                     rx_activity_count <= rx_activity_count - 1;
                 end if;
@@ -671,7 +740,7 @@ begin
                 -- command recover even if a newline was lost on the wire.
                 if rx_position /= 0 or rx_discard = '1' or
                    rx_binary_state /= 0 or rx_display_state /= 0 or
-                   rx_cal_state /= 0 or rx_gen_state /= 0 or rx_scan_state /= 0 then
+                   rx_cal_state /= 0 or rx_gen_state /= 0 or rx_fft_state /= 0 or rx_scan_state /= 0 then
                     if rx_byte_valid = '1' then
                         rx_idle_count <= 0;
                     elsif rx_idle_count = 5000000 then
@@ -681,7 +750,7 @@ begin
                         rx_display_state <= 0;
                         rx_cal_state <= 0;
                         rx_gen_state <= 0;
-                        rx_scan_state <= 0;
+                        rx_scan_state <= 0; rx_fft_state <= 0;
                         rx_idle_count <= 0;
                         command_error <= '1';
                     else
@@ -696,15 +765,17 @@ begin
                     rx_display_state <= 0;
                     rx_cal_state <= 0;
                     rx_gen_state <= 0;
-                    rx_scan_state <= 0;
+                    rx_scan_state <= 0; rx_fft_state <= 0;
                     rx_position   <= 0;
                     rx_discard    <= '0';
                     rx_idle_count <= 0;
                     command_error <= '1';
                 end if;
 
-                if key_previous(0) = '1' and key_sync(0) = '0' then
-                    if selected_channel = 5 then
+                if key_previous(0) = '1' and key_debounced(0) = '0' then
+                    if manual_mode = '1' then
+                        if display_timebase < 10 then display_timebase <= display_timebase + 1; end if;
+                    elsif selected_channel = 5 then
                         selected_channel <= 0;
                         channel_mask <= "000001";
                     else
@@ -712,8 +783,10 @@ begin
                         channel_mask <= std_logic_vector(shift_left(to_unsigned(1, 6), selected_channel + 1));
                     end if;
                     capture_config_revision <= capture_config_revision + 1;
-                elsif key_previous(1) = '1' and key_sync(1) = '0' then
-                    if selected_channel = 0 then
+                elsif key_previous(1) = '1' and key_debounced(1) = '0' then
+                    if manual_mode = '1' then
+                        if display_timebase > 0 then display_timebase <= display_timebase - 1; end if;
+                    elsif selected_channel = 0 then
                         selected_channel <= 5;
                         channel_mask <= "100000";
                     else
@@ -729,7 +802,34 @@ begin
                     -- The dedicated capture parser receives the same byte;
                     -- discard any partial legacy line here so it cannot turn
                     -- a valid capture request into a spurious error.
-                    if rx_byte = x"AA" and legacy_parser_busy = '0' then
+                    if capture_rx_busy = '1' then
+                        -- The capture parser owns all four bytes after AA.
+                        -- Do not interpret its payload as an ASCII command.
+                        null;
+                    elsif rx_fft_state = 1 then
+                        if unsigned(rx_byte) <= 10 then
+                            rx_fft_timebase <= rx_byte(3 downto 0);
+                            rx_fft_checksum <= rx_fft_checksum xor rx_byte; rx_fft_state <= 2;
+                        else rx_fft_state <= 0; command_error <= '1'; end if;
+                    elsif rx_fft_state = 2 then
+                        rx_fft_id(15 downto 8) <= rx_byte;
+                        rx_fft_checksum <= rx_fft_checksum xor rx_byte; rx_fft_state <= 3;
+                    elsif rx_fft_state = 3 then
+                        rx_fft_id(7 downto 0) <= rx_byte;
+                        rx_fft_checksum <= rx_fft_checksum xor rx_byte; rx_fft_state <= 4;
+                    elsif rx_fft_state = 4 then
+                        rx_fft_state <= 0;
+                        if rx_byte = rx_fft_checksum then
+                            if fft_busy = '0' then
+                                fft_timebase <= rx_fft_timebase; fft_request_id <= rx_fft_id; fft_request <= '1';
+                            end if;
+                            command_seen <= '1'; command_error <= '0';
+                        else command_error <= '1'; end if;
+                    elsif rx_byte = x"AC" and legacy_parser_busy = '0' then
+                        rx_fft_state <= 1; rx_fft_checksum <= x"AC";
+                    elsif rx_byte = x"AD" and legacy_parser_busy = '0' then
+                        fft_cancel <= '1';
+                    elsif (rx_byte = x"AA" or rx_byte = x"AB") and legacy_parser_busy = '0' then
                         rx_position      <= 0;
                         rx_discard       <= '0';
                         rx_binary_state  <= 0;
@@ -828,20 +928,24 @@ begin
                     elsif rx_display_state = 8 then
                         rx_display_state <= 0;
                         if rx_byte = rx_display_checksum then
-                            display_timebase <= rx_display_timebase;
                             display_scale <= rx_display_scale;
                             display_position <= rx_display_position;
-                            display_trigger <= rx_display_trigger;
-                            display_trigger_level <=
-                                to_integer(unsigned(rx_display_level_high)) * 256 +
-                                to_integer(unsigned(rx_display_level_low));
                             display_grid <= rx_display_flags(0);
-                            display_run <= rx_display_flags(1);
-                            display_trigger_position <= to_integer(unsigned(rx_display_flags(3 downto 2)));
-                            display_single <= rx_display_flags(4);
-                            display_average <= to_integer(unsigned(rx_display_flags(6 downto 5)));
-                            display_stabilize <= rx_display_flags(7);
-                            capture_config_revision <= capture_config_revision + 1;
+                            -- Manual voltage edits must not replace the saved
+                            -- phone trigger, averaging, or acquisition state.
+                            if manual_mode = '0' then
+                                display_timebase <= rx_display_timebase;
+                                display_trigger <= rx_display_trigger;
+                                display_trigger_level <=
+                                    to_integer(unsigned(rx_display_level_high)) * 256 +
+                                    to_integer(unsigned(rx_display_level_low));
+                                display_run <= rx_display_flags(1);
+                                display_trigger_position <= to_integer(unsigned(rx_display_flags(3 downto 2)));
+                                display_single <= rx_display_flags(4);
+                                display_average <= to_integer(unsigned(rx_display_flags(6 downto 5)));
+                                display_stabilize <= rx_display_flags(7);
+                                capture_config_revision <= capture_config_revision + 1;
+                            end if;
                             command_seen <= '1';
                             command_error <= '0';
                         else
@@ -1113,6 +1217,7 @@ begin
                 tx_pending        <= '0';
                 tx_capture_pending <= '0';
                 capture_tx_pop    <= '0';
+                live_tx_pop <= '0'; fft_tx_pop <= '0'; tx_stream <= 0;
                 packet_adc_sample    <= (others => '0');
                 packet_channel       <= (others => '0');
                 packet_sample_period <= (others => '0');
@@ -1121,9 +1226,24 @@ begin
             else
                 tx_trigger <= '0';
                 capture_tx_pop <= '0';
+                live_tx_pop <= '0'; fft_tx_pop <= '0';
 
                 if tx_ready = '1' and tx_pending = '0' then
-                    if capture_tx_valid = '1' and uart_index = 0 then
+                    if fft_tx_valid = '1' and uart_index = 0 and
+                       (tx_stream /= 2 or live_tx_valid = '0') and
+                       (tx_stream /= 1 or capture_tx_valid = '0') then
+                        tx_byte <= fft_tx_data; tx_trigger <= '1'; tx_pending <= '1';
+                        tx_capture_pending <= '1'; fft_tx_pop <= '1'; tx_stream <= 3;
+                    elsif live_tx_valid = '1' and uart_index = 0 and
+                       (tx_stream = 2 or capture_tx_valid = '0') and
+                       (tx_stream /= 3 or fft_tx_valid = '0') then
+                        tx_byte <= live_tx_data;
+                        tx_trigger <= '1'; tx_pending <= '1';
+                        tx_capture_pending <= '1'; live_tx_pop <= '1';
+                        tx_stream <= 2;
+                    elsif capture_tx_valid = '1' and uart_index = 0 and
+                          (tx_stream /= 2 or live_tx_valid = '0') and
+                          (tx_stream /= 3 or fft_tx_valid = '0') then
                         -- Deep-capture bytes have priority over telemetry and
                         -- remain asserted until this handshake is accepted.
                         tx_byte <= capture_tx_data;
@@ -1131,7 +1251,9 @@ begin
                         tx_pending <= '1';
                         tx_capture_pending <= '1';
                         capture_tx_pop <= '1';
+                        tx_stream <= 1;
                     else
+                        tx_stream <= 0;
                         tx_capture_pending <= '0';
                         if uart_index = 0 then
                             packet_adc_sample <= std_logic_vector(
@@ -1156,7 +1278,7 @@ begin
                     if tx_capture_pending = '0' then
                         if uart_index = UART_PACKET_BYTES - 1 then
                             uart_index <= 0;
-                            telemetry_channel <= next_enabled_channel(telemetry_channel, channel_mask);
+                            telemetry_channel <= next_enabled_channel(telemetry_channel, active_channel_mask);
                         else
                             uart_index <= uart_index + 1;
                         end if;
@@ -1175,7 +1297,7 @@ begin
         port map (
             clk      => MAX10_CLK1_50,
             reset    => reset,
-            high_speed => baud_select_sync,
+            high_speed => '1',
             tx_start => tx_trigger,
             tx_data  => tx_byte,
             tx       => tx_serial,
@@ -1198,22 +1320,27 @@ begin
             scan_sample_data => adc_scan_sample,
             scan_sample_strobe => adc_scan_strobe,
             scan_sample_channel => adc_scan_channel,
-            channel           => std_logic_vector(to_unsigned(selected_channel, 3)),
-            channel_mask      => channel_mask,
+            channel           => std_logic_vector(to_unsigned(active_channel, 3)),
+            channel_mask      => active_channel_mask,
             channel_samples   => vga_channel_samples,
             timebase          => std_logic_vector(to_unsigned(display_timebase, 4)),
             vertical_scale    => std_logic_vector(to_unsigned(display_scale, 2)),
             vertical_position => std_logic_vector(to_unsigned(display_position, 7)),
-            trigger_mode      => std_logic_vector(to_unsigned(display_trigger, 2)),
+            trigger_mode      => std_logic_vector(to_unsigned(active_trigger, 2)),
             trigger_level     => std_logic_vector(to_unsigned(display_trigger_level, 12)),
             grid_enable       => display_grid,
-            run_enable        => display_run,
+            run_enable        => active_run,
+            manual_mode       => manual_mode,
             trigger_position  => std_logic_vector(to_unsigned(display_trigger_position, 2)),
-            single_shot       => display_single,
-            average_mode      => std_logic_vector(to_unsigned(display_average, 2)),
-            stabilize_enable  => display_stabilize,
+            single_shot       => active_single,
+            average_mode      => std_logic_vector(to_unsigned(active_average, 2)),
+            stabilize_enable  => active_stabilize,
             sample_period_cycles => std_logic_vector(adc_sample_period),
             full_scale_mv     => std_logic_vector(to_unsigned(adc_full_scale_mv, 16)),
+            live_request      => live_request,
+            live_tx_data      => live_tx_data,
+            live_tx_valid     => live_tx_valid,
+            live_tx_pop       => live_tx_pop,
             VGA_R             => VGA_R,
             VGA_G             => VGA_G,
             VGA_B             => VGA_B,
@@ -1247,20 +1374,20 @@ begin
             iDIG  => display_digits
         );
 
-    HEX0(6 downto 0) <= hex_segments(6 downto 0) when channel_mask(2) = '1' else (others => '1');
-    HEX1(6 downto 0) <= hex_segments(13 downto 7) when channel_mask(2) = '1' else (others => '1');
-    HEX2(6 downto 0) <= hex_segments(20 downto 14) when channel_mask(1) = '1' else (others => '1');
-    HEX3(6 downto 0) <= hex_segments(27 downto 21) when channel_mask(1) = '1' else (others => '1');
-    HEX4(6 downto 0) <= hex_segments(34 downto 28) when channel_mask(0) = '1' else (others => '1');
-    HEX5(6 downto 0) <= hex_segments(41 downto 35) when channel_mask(0) = '1' else (others => '1');
+    HEX0(6 downto 0) <= hex_segments(6 downto 0) when active_channel_mask(2) = '1' else (others => '1');
+    HEX1(6 downto 0) <= hex_segments(13 downto 7) when active_channel_mask(2) = '1' else (others => '1');
+    HEX2(6 downto 0) <= hex_segments(20 downto 14) when active_channel_mask(1) = '1' else (others => '1');
+    HEX3(6 downto 0) <= hex_segments(27 downto 21) when active_channel_mask(1) = '1' else (others => '1');
+    HEX4(6 downto 0) <= hex_segments(34 downto 28) when active_channel_mask(0) = '1' else (others => '1');
+    HEX5(6 downto 0) <= hex_segments(41 downto 35) when active_channel_mask(0) = '1' else (others => '1');
     HEX0(7) <= '1';
-    HEX1(7) <= not channel_mask(2);
+    HEX1(7) <= not active_channel_mask(2);
     HEX2(7) <= '1';
-    HEX3(7) <= not channel_mask(1);
+    HEX3(7) <= not active_channel_mask(1);
     HEX4(7) <= '1';
-    HEX5(7) <= not channel_mask(0);
+    HEX5(7) <= not active_channel_mask(0);
 
-    channel_leds <= channel_mask;
+    channel_leds <= active_channel_mask;
 
     LEDR(5 downto 0) <= channel_leds;
     LEDR(6)          <= adc_seen_sync;
