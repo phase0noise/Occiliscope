@@ -137,6 +137,7 @@ architecture rtl of oscilloscope is
             sample_period_cycles : in std_logic_vector(23 downto 0);
             full_scale_mv     : in  std_logic_vector(15 downto 0);
             live_request      : in  std_logic;
+            live_metadata_request : in std_logic;
             live_tx_data      : out std_logic_vector(7 downto 0);
             live_tx_valid     : out std_logic;
             live_tx_pop       : in  std_logic;
@@ -334,6 +335,7 @@ architecture rtl of oscilloscope is
     signal capture_tx_valid       : std_logic;
     signal capture_tx_pop         : std_logic := '0';
     signal live_request           : std_logic;
+    signal live_metadata_request  : std_logic;
     signal live_tx_data           : std_logic_vector(7 downto 0);
     signal live_tx_valid          : std_logic;
     signal live_tx_pop            : std_logic := '0';
@@ -359,6 +361,8 @@ architecture rtl of oscilloscope is
 begin
     reset <= SW9;
     live_request <= '1' when rx_byte_valid = '1' and rx_byte = x"AB" and
+                              legacy_parser_busy = '0' and capture_rx_busy = '0' else '0';
+    live_metadata_request <= '1' when rx_byte_valid = '1' and rx_byte = x"AE" and
                               legacy_parser_busy = '0' and capture_rx_busy = '0' else '0';
 
     -- Two independent synthesizable pulse generators. Configuration arrives
@@ -829,7 +833,7 @@ begin
                         rx_fft_state <= 1; rx_fft_checksum <= x"AC";
                     elsif rx_byte = x"AD" and legacy_parser_busy = '0' then
                         fft_cancel <= '1';
-                    elsif (rx_byte = x"AA" or rx_byte = x"AB") and legacy_parser_busy = '0' then
+                    elsif (rx_byte = x"AA" or rx_byte = x"AB" or rx_byte = x"AE") and legacy_parser_busy = '0' then
                         rx_position      <= 0;
                         rx_discard       <= '0';
                         rx_binary_state  <= 0;
@@ -1338,6 +1342,7 @@ begin
             sample_period_cycles => std_logic_vector(adc_sample_period),
             full_scale_mv     => std_logic_vector(to_unsigned(adc_full_scale_mv, 16)),
             live_request      => live_request,
+            live_metadata_request => live_metadata_request,
             live_tx_data      => live_tx_data,
             live_tx_valid     => live_tx_valid,
             live_tx_pop       => live_tx_pop,

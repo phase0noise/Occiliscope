@@ -11,7 +11,7 @@ function scopeHarness(options = {}) {
   const elements = new Map();
   const requests = [];
   const timers = new Map();
-  let nextTimer = 0, events;
+  let nextTimer = 0, events, drawFrame;
   function element(value = "") {
     const listeners = new Map();
     return {
@@ -40,7 +40,7 @@ function scopeHarness(options = {}) {
   const panel = element();
   const context = {
     FpgaOscilloscopeProtocol: protocol, console, URLSearchParams,
-    performance: {now: () => 2000}, requestAnimationFrame() {},
+    performance: {now: () => 2000}, requestAnimationFrame(callback) { drawFrame=callback; },
     setInterval() {},
     setTimeout(callback) { timers.set(++nextTimer, callback); return nextTimer; },
     clearTimeout(id) { timers.delete(id); },
@@ -62,11 +62,11 @@ function scopeHarness(options = {}) {
   };
   context.window = context;
   vm.runInNewContext(fs.readFileSync(path.join(__dirname, "../scope.js"), "utf8"), context);
-  function telemetry(pc) {
+  function telemetry(pc,extra={}) {
     events.onmessage({data: JSON.stringify({pc, fresh: false, pps: 10, packets: 10,
-      cmds: 0, errors: 0, uptime: 1000, baud: 115200, ch: 0, vm: 1, av: [1000,0,0,0,0,0]})});
+      cmds: 0, errors: 0, uptime: 1000, baud: 115200, ch: 0, vm: 1, av: [1000,0,0,0,0,0],...extra})});
   }
-  return {elements, requests, telemetry, channels, focusButtons, timers, document:context.document};
+  return {elements, requests, telemetry, channels, focusButtons, timers, draw:()=>drawFrame(), document:context.document};
 }
 
 test("slider and total-time dropdown send the same FPGA timebase", async () => {
@@ -197,4 +197,37 @@ test("comparison buttons toggle traces independently of the focus dropdown",asyn
   assert.equal(channels[3].checked,true);
   query=new URL(requests.at(-1),"http://pico").searchParams;
   assert.equal(query.get("focus"),"3");assert.equal(query.get("mask"),"9");
+});
+
+test("UART live rolls individual ADC readings and switches back to VGA snapshots",async()=>{
+  const {elements,telemetry,draw,requests,timers}=scopeHarness();
+  telemetry(800,{pps:1200});assert.equal(elements.get("rateText").textContent,"1.2k pkt/s");
+  elements.get("rawSourceButton").dispatch("click");
+  await new Promise(resolve=>setImmediate(resolve));
+  const poll=[...timers.values()].find(callback=>callback.name==="pollLiveFrame");await poll();
+  assert.ok(requests.some(url=>url.startsWith("/api/live?raw=1")));
+  telemetry(800,{clockUs:100000,raw:[[0,1000,2000],[0,3000,1000],[0,2000,0]]});draw();
+  assert.equal(elements.get("samplesText").textContent,"3");
+  assert.match(elements.get("measurementSource").textContent,/undersampled/);
+  assert.equal(elements.get("triggerText").textContent,"UART · LIVE");
+  elements.get("pauseButton").dispatch("click");
+  telemetry(800,{clockUs:133000,raw:[[0,4000,0]]});draw();
+  assert.equal(elements.get("samplesText").textContent,"3");
+  assert.equal(elements.get("triggerText").textContent,"UART · HOLD");
+  elements.get("snapshotSourceButton").dispatch("click");
+  assert.equal(elements.get("phoneSourceHint").textContent,"Same window as the VGA display");
+});
+
+test("long UART windows retain extrema without filling their history with only recent samples",()=>{
+  const {elements,telemetry,draw}=scopeHarness();
+  elements.get("timebase").value="10";telemetry(800);
+  elements.get("rawSourceButton").dispatch("click");
+  for(let batch=0;batch<80;batch++)telemetry(800,{
+    clockUs:100000+batch*64000,
+    raw:Array.from({length:64},(_,n)=>[0,n%2?3000:1000,(63-n)*1000])
+  });
+  draw();const count=Number(elements.get("samplesText").textContent);
+  assert.ok(count>250&&count<300);
+  assert.equal(elements.get("minText").textContent,"1.221 V");
+  assert.equal(elements.get("maxText").textContent,"3.662 V");
 });

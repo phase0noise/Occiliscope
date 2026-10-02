@@ -29,6 +29,7 @@ module scope_vga (
     input  wire [23:0] sample_period_cycles,
     input  wire [15:0] full_scale_mv,
     input  wire        live_request,
+    input  wire        live_metadata_request,
     output wire [7:0]  live_tx_data,
     output wire        live_tx_valid,
     input  wire        live_tx_pop,
@@ -253,7 +254,8 @@ module scope_vga (
             snapshot_max_sample : snapshot_channel_max[live_ch*12 +: 12];
     end endgenerate
     scope_live phone_window (
-        .clk(clk), .reset(reset), .request(live_request), .frame_begin(frame_tick && snapshot_refresh),
+        .clk(clk), .reset(reset), .request(live_request), .metadata_request(live_metadata_request),
+        .frame_begin(frame_tick), .snapshot_ready(snapshot_refresh),
         .column_write(snapshot_copy_active && snapshot_copy_valid && !frame_tick),
         .column_index(snapshot_copy_index-10'd1), .column_mean(snapshot_channel_traces),
         .column_min(live_column_min), .column_max(live_column_max),

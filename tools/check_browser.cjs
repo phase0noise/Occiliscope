@@ -80,6 +80,12 @@ async function main() {
         expression: 'document.documentElement.scrollWidth > innerWidth', returnByValue: true
       });
       if (layout.result.value) throw new Error(name + ' page overflows horizontally.');
+      if(mobile) {
+        const badgeLayout=await page('Runtime.evaluate',{
+          expression:'(()=>{const badges=[...document.querySelectorAll(".status-row .pill")].map(node=>node.getBoundingClientRect());return Math.max(...badges.map(b=>b.top))-Math.min(...badges.map(b=>b.top))<2})()',returnByValue:true
+        });
+        if(!badgeLayout.result.value)throw new Error('Phone status badges wrap above 1k packets/sec.');
+      }
       const controls = await page('Runtime.evaluate', {
         expression: '[...document.querySelectorAll(".channel-toggle span")].every(button => button.getBoundingClientRect().width >= 60 && button.getBoundingClientRect().height >= 40)', returnByValue: true
       });
@@ -95,7 +101,12 @@ async function main() {
     await delay(100);
     const spectrum = await page('Page.captureScreenshot', {format: 'png'});
     fs.writeFileSync(path.join(output, 'scope-mobile-fft.png'), Buffer.from(spectrum.data, 'base64'));
-    console.log('PASS: stable menus, channel buttons, live waveforms, saved capture, FFT spectrum/cancel, and mobile layout');
+    await page('Emulation.setDeviceMetricsOverride', {width:320,height:844,deviceScaleFactor:1,mobile:true});
+    const narrow=await page('Runtime.evaluate', {
+      expression:'document.documentElement.scrollWidth > innerWidth',returnByValue:true
+    });
+    if(narrow.result.value)throw new Error('320px phone layout overflows.');
+    console.log('PASS: stable controls, snapshots/UART live, saved capture, FFT, 1k packet badges, and mobile layout');
   } finally {
     if (send) await send('Browser.close').catch(() => {});
     if (socket) socket.close();

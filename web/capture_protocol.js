@@ -26,7 +26,8 @@
 
   function decodeLiveFrame(input) {
     const bytes = bytesOf(input);
-    if (bytes.length < 34 || bytes[0] !== 0xd7 || bytes[1] !== 1 ||
+    const metadataOnly=bytes[0]===0xd9;
+    if (bytes.length < 34 || (bytes[0] !== 0xd7 && !metadataOnly) || bytes[1] !== 1 ||
         u16(bytes,2) !== bytes.length) throw new Error("Incomplete VGA frame.");
     let crc = 0xffff;
     for (let i=0; i<bytes.length-2; i++) {
@@ -40,12 +41,12 @@
     if (!mask || mask>63 || !(mask & (1<<bytes[5])) || bytes[5]>5 ||
         columns!==288 || !period || bytes[6]>10 || bytes[7]>3 || bytes[8]>100 ||
         bytes[9]>3 || bytes[10]>3 || u16(bytes,16)<1000 || u16(bytes,16)>9999 ||
-        u16(bytes,26)>576 || bytes.length!==34+columns*(1+6*channels.length))
+        u16(bytes,26)>576 || bytes.length!==(metadataOnly?34:34+columns*(1+6*channels.length)))
       throw new Error("Invalid VGA frame settings.");
     const traces=Array.from({length:6},()=>[]);
     const intervalSeconds=period*(2**bytes[6])/50000000;
     let offset=32;
-    for (let column=0; column<columns; column++) {
+    for (let column=0; column<(metadataOnly?0:columns); column++) {
       const valid=bytes[offset++];
       for (const ch of channels) {
         const adc=u16(bytes,offset), low=u16(bytes,offset+2), high=u16(bytes,offset+4);
@@ -62,7 +63,22 @@
       grid:Boolean(bytes[11]&1), stabilize:Boolean(bytes[11]&128),
       triggerLevel:u16(bytes,24), manualMode:Boolean(bytes[28]&1),
       samplePeriodCycles:period, fullScaleMv:u16(bytes,16),
-      windowMs:576*intervalSeconds*1000, traces};
+      windowMs:576*intervalSeconds*1000, metadataOnly, traces};
+  }
+  function decodeRawBatch(data,previousClock=null,previousTime=0) {
+    const clock=data.clockUs;
+    if(!Number.isInteger(clock)||clock<0||clock>0xffffffff||!Array.isArray(data.raw)||data.raw.length>64)
+      throw new Error("Invalid UART live batch.");
+    const delta=previousClock===null?0:(clock-previousClock)>>>0;
+    const reset=previousClock!==null&&delta>10000000;
+    const timeMs=reset?0:previousTime+delta/1000;
+    const samples=data.raw.map(sample=>{
+      if(!Array.isArray(sample)||sample.length!==3||sample.some(value=>!Number.isInteger(value))||
+          sample[0]<0||sample[0]>5||sample[1]<0||sample[1]>4095||sample[2]<0||sample[2]>10000000)
+        throw new Error("Invalid UART live sample.");
+      return {channel:sample[0],adc:sample[1],timeMs:timeMs-sample[2]/1000};
+    });
+    return {clockUs:clock,timeMs,reset,samples,drops:Number(data.drops)||0};
   }
   const ADC_MAX = 4095;
   function decodeFftFrame(input) {
@@ -516,6 +532,7 @@
     VGA_PLOT_SAMPLES,
     vgaTimeOptions,
     decodeLiveFrame,
+    decodeRawBatch,
     decodeFftFrame,
     FLAG_COMPLETE,
     FLAG_TRIGGERED,

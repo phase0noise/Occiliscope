@@ -19,6 +19,8 @@
   let manualMode = false, boardFrameKnown = false;
   let timeOptionsPeriod = 0, timeOptionsKnown = false;
   let fftSnapshot=null, fftBusy=false, fftCancelRequested=false;
+  let phoneSource="snapshot", rawClock=null, rawTimeMs=0, rawViewTimeMs=0, rawWindowMs=0;
+  const rawBuckets=Array.from({length:6},()=>({id:null,sum:0,count:0}));
 
   const $ = id => document.getElementById(id);
   const canvas = $("scope"), ctx = canvas.getContext("2d", {alpha:false});
@@ -117,7 +119,51 @@
   function updateChannelButtons(){
     drawNeeded=true;
   }
-  function clearSamples() { for(const trace of traces){trace.head=0;trace.count=0;} drawNeeded=true; }
+  function clearSamples() {
+    for(const trace of traces){trace.head=0;trace.count=0;}
+    for(const bucket of rawBuckets){bucket.id=null;bucket.sum=0;bucket.count=0;}
+    drawNeeded=true;
+  }
+  function appendRawBatch(data) {
+    const batch=CaptureProtocol.decodeRawBatch(data,rawClock,rawTimeMs);
+    if(batch.reset)clearSamples();
+    rawClock=batch.clockUs;rawTimeMs=batch.timeMs;
+    const windowMs=selectedPhoneWindowMs();
+    if(!paused&&Math.abs(windowMs-rawWindowMs)>Math.max(.01,rawWindowMs*.005)) {
+      clearSamples();rawWindowMs=windowMs;
+    }
+    const bucketMs=Math.max(0.001,windowMs/(CAPACITY-1));
+    if(!paused)for(const sample of batch.samples) {
+      if(!(channelMask()&(1<<sample.channel)))continue;
+      const trace=traces[sample.channel],bucket=rawBuckets[sample.channel];
+      const id=Math.floor(sample.timeMs/bucketMs);
+      if(bucket.id!==id) {
+        bucket.id=id;bucket.sum=sample.adc;bucket.count=1;
+        pushSample(sample.channel,sample.adc,sample.adc,sample.adc,sample.timeMs);
+      } else {
+        bucket.sum+=sample.adc;bucket.count++;
+        const index=(trace.head-1+CAPACITY)%CAPACITY;
+        trace.values[index]=Math.round(bucket.sum/bucket.count);
+        trace.lows[index]=Math.min(trace.lows[index],sample.adc);
+        trace.highs[index]=Math.max(trace.highs[index],sample.adc);
+        trace.times[index]=sample.timeMs;trace.latest=sample.adc;
+      }
+    }
+    if(!paused){rawViewTimeMs=rawTimeMs;drawNeeded=true;}
+    $("measurementSource").textContent="UART live · undersampled ADC readings · "+(batch.drops?`${batch.drops} readings skipped by Wi-Fi`:"time uses Pico receipt timestamps");
+  }
+  function setPhoneSource(next) {
+    phoneSource=next==="raw"?"raw":"snapshot";
+    lastFetchedFrameId=null;rawClock=null;rawTimeMs=0;rawViewTimeMs=0;rawWindowMs=0;clearSamples();
+    for(const [id,mode] of [["snapshotSourceButton","snapshot"],["rawSourceButton","raw"]]) {
+      const selected=phoneSource===mode;
+      $(id).classList.toggle("active",selected);$(id).setAttribute("aria-pressed",String(selected));
+    }
+    $("phoneSourceHint").textContent=phoneSource==="raw"?"Undersampled · fast updates":"Same window as the VGA display";
+    if(phoneSource==="snapshot"&&liveFrame)for(let ch=0;ch<6;ch++)for(const point of liveFrame.traces[ch])
+      pushSample(ch,point.adc,point.low,point.high,point.timeMs);
+    drawNeeded=true;
+  }
 
   function resizeCanvas() {
     const rect = canvas.getBoundingClientRect();
@@ -190,7 +236,8 @@
     ctx.moveTo(left,top+plotH/2); ctx.lineTo(left+plotW,top+plotH/2);
     ctx.moveTo(left+plotW/2,top); ctx.lineTo(left+plotW/2,top+plotH); ctx.stroke();
 
-    const windowMs = liveFrame ? liveFrame.windowMs : selectedPhoneWindowMs();
+    const raw=phoneSource==="raw";
+    const windowMs = !raw&&liveFrame ? liveFrame.windowMs : selectedPhoneWindowMs();
     if (!(windowMs > 0)) return;
     const triggerMode = $("triggerMode").value;
     const triggerRaw = Number($("triggerLevel").value);
@@ -198,7 +245,7 @@
     const focus=Number($("channel").value),focusTrace=traces[focus];
     const enabled=enabledChannels();
 
-    const range={start:0,end:windowMs};
+    const range=raw?{start:rawViewTimeMs-windowMs,end:rawViewTimeMs}:{start:0,end:windowMs};
     let min=ADC_MAX, max=0, visible=0;
     for(let i=0;i<focusTrace.count;i++){const j=indexAt(focusTrace,i),t=focusTrace.times[j];if(t>=range.start&&t<=range.end){if(focusTrace.lows[j]<min)min=focusTrace.lows[j];if(focusTrace.highs[j]>max)max=focusTrace.highs[j];visible++;}}
     if (!visible) { min=0; max=ADC_MAX; }
@@ -207,13 +254,13 @@
     let yMin=center-2048/scale,yMax=center+2048/scale;
 
     const yOf = v => top + Math.max(0,Math.min(plotH,plotH-(v-yMin)*plotH/(yMax-yMin)));
-    if(triggerMode!=="free" && triggerRaw>=yMin && triggerRaw<=yMax){ const ty=yOf(triggerRaw); ctx.setLineDash([6*dpr,5*dpr]);ctx.strokeStyle="#ffc85799";ctx.beginPath();ctx.moveTo(left,ty);ctx.lineTo(left+plotW,ty);ctx.stroke();ctx.setLineDash([]); }
-    if(triggerMode!=="free"){const tx=left+plotW*pretrigger;ctx.setLineDash([4*dpr,5*dpr]);ctx.strokeStyle="#ffc85766";ctx.beginPath();ctx.moveTo(tx,top);ctx.lineTo(tx,top+plotH);ctx.stroke();ctx.setLineDash([]);}
+    if(!raw&&triggerMode!=="free" && triggerRaw>=yMin && triggerRaw<=yMax){ const ty=yOf(triggerRaw); ctx.setLineDash([6*dpr,5*dpr]);ctx.strokeStyle="#ffc85799";ctx.beginPath();ctx.moveTo(left,ty);ctx.lineTo(left+plotW,ty);ctx.stroke();ctx.setLineDash([]); }
+    if(!raw&&triggerMode!=="free"){const tx=left+plotW*pretrigger;ctx.setLineDash([4*dpr,5*dpr]);ctx.strokeStyle="#ffc85766";ctx.beginPath();ctx.moveTo(tx,top);ctx.lineTo(tx,top+plotH);ctx.stroke();ctx.setLineDash([]);}
 
     ctx.font=`500 ${12*dpr}px ui-monospace,monospace`;ctx.fillStyle="#c4d4e5";ctx.textAlign="right";
     for(let y=0;y<=4;y++){const raw=yMax-(yMax-yMin)*y/4;ctx.fillText(volts(raw).toFixed(2)+"V",left-6*dpr,top+plotH*y/4+3*dpr);}
     const timeTicks=plotW/dpr<500?4:8;
-    for(let x=0;x<=timeTicks;x++){ctx.textAlign=x===0?"left":x===timeTicks?"right":"center";const relative=triggerMode==="free"?(x/timeTicks-1):(x/timeTicks-pretrigger);const seconds=windowMs*relative/1000;ctx.fillText(formatAxisTime(seconds),left+plotW*x/timeTicks,h-12*dpr);}
+    for(let x=0;x<=timeTicks;x++){ctx.textAlign=x===0?"left":x===timeTicks?"right":"center";const relative=raw||triggerMode==="free"?(x/timeTicks-1):(x/timeTicks-pretrigger);const seconds=windowMs*relative/1000;ctx.fillText(formatAxisTime(seconds),left+plotW*x/timeTicks,h-12*dpr);}
     updateXAxisReadout(windowMs / 1000);
 
     $("traceLegend").innerHTML=enabled.map(ch=>`<span class="trace-chip" style="color:${TRACE_COLORS[ch]}">CH${ch} ${traces[ch].count?volts(traces[ch].latest).toFixed(2)+"V":"--"}${ch===focus?" · FOCUS":""}</span>`).join("");
@@ -228,10 +275,11 @@
         bucketMin[column]=Math.min(bucketMin[column],trace.lows[j]);bucketMax[column]=Math.max(bucketMax[column],trace.highs[j]);pointCount++;
       }
       ctx.lineJoin="round";ctx.lineCap="round";
-      if (liveFrame) {
+      if (liveFrame||raw) {
         ctx.beginPath();
         for(let i=0;i<trace.count;i++){
-          const j=indexAt(trace,i),x=left+trace.times[j]*plotW/windowMs;
+          const j=indexAt(trace,i),t=trace.times[j];if(t<range.start||t>range.end)continue;
+          const x=left+(t-range.start)*plotW/windowMs;
           ctx.moveTo(x,yOf(trace.lows[j]));ctx.lineTo(x,yOf(trace.highs[j]));
         }
         ctx.strokeStyle=TRACE_COLORS[ch]+"44";ctx.lineWidth=1*dpr;ctx.stroke();
@@ -258,7 +306,7 @@
     $("periodText").textContent=measurement.periodMs?formatPeriodSeconds(measurement.periodMs/1000):"--";
     $("dutyText").textContent=measurement.dutyPercent===null?"-- %":measurement.dutyPercent.toFixed(1)+" %";
     $("samplesText").textContent=String(traces.reduce((total,trace)=>total+trace.count,0));
-    $("triggerText").textContent=(paused?"HOLD · ":"LIVE · ")+triggerMode.toUpperCase();
+    $("triggerText").textContent=raw?(paused?"UART · HOLD":"UART · LIVE"):(paused?"HOLD · ":"LIVE · ")+triggerMode.toUpperCase();
     renderLiveChannelAnalysis(range);
   }
 
@@ -387,6 +435,7 @@
     $("liveModeButton").setAttribute("aria-selected", String(live));
     $("captureModeButton").setAttribute("aria-selected", String(!live));
     $("captureCursorReadout").hidden = live || !captureRecord;
+    $("phoneSource").hidden=!live;
     $("measurementSource").textContent = live
       ? "Live VGA window · all enabled channels · mean and peak envelope"
       : "Saved focus capture · acquisition timestamps and peak envelope";
@@ -458,6 +507,7 @@
   }
 
   function invalidateWaveform(preserveRecord = false) {
+    if(phoneSource==="raw"&&!preserveRecord)clearSamples();
     autoSnapshotGeneration++;
     if (!preserveRecord) captureRecord = null;
     if (!captureRecord) captureViewport = {
@@ -1127,12 +1177,13 @@
   source.onmessage=event=>{
     try {
       const d=JSON.parse(event.data);lastEventAt=performance.now();
+      markConnected();
       if(Number.isFinite(d.pc)&&d.pc>0){
         measuredSampleCycles=d.pc;
         if(!labeledSampleCycles||Math.abs(measuredSampleCycles-labeledSampleCycles)>Math.max(2,labeledSampleCycles*0.005)){labeledSampleCycles=measuredSampleCycles;updateVgaTimeControl(false);}
       }
       setPill($("uartPill"),d.fresh?"ok":"",""+(d.fresh?"FPGA streaming":"Waiting for FPGA"));
-      $("rateText").textContent=d.pps+" pkt/s";$("packetsText").textContent=d.packets.toLocaleString();
+      $("rateText").textContent=(d.pps>=1000?(d.pps/1000).toFixed(1)+"k":d.pps)+" pkt/s";$("packetsText").textContent=d.packets.toLocaleString();
       $("commandsText").textContent=d.cmds.toLocaleString();
       $("errorsText").textContent=d.errors;$("uptimeText").textContent=Math.floor(d.uptime/1000)+" s";
       $("baudText").textContent=d.baud.toLocaleString();$("footerBaud").textContent=d.baud.toLocaleString()+" baud";
@@ -1140,7 +1191,7 @@
       $("gen2Actual").textContent=formatGeneratorActual(2,d.g1hz,d.g1d,d.g1e);
       $("channelLive").textContent="CH"+$("channel").value;
       const focus=Number($("channel").value),focusRaw=Array.isArray(d.av)?d.av[focus]:d.latest;
-      if(d.vm&(1<<focus)){$("voltageText").textContent=`CH${focus}  ${formatVolts(focusRaw)}`;$("rawText").textContent="ADC "+pad4(focusRaw);}
+      if((d.vm&(1<<focus))&&!(phoneSource==="raw"&&paused)){$("voltageText").textContent=`CH${focus}  ${formatVolts(focusRaw)}`;$("rawText").textContent="ADC "+pad4(focusRaw);}
       if(Array.isArray(d.av))for(let ch=0;ch<3;ch++){
         const active=Boolean(d.vm&(1<<ch)),pair=$("hexCh"+ch),readout=$("previewCh"+ch);
         pair.classList.toggle("disabled",!active);
@@ -1149,6 +1200,7 @@
       // Do not overwrite the channel select here. Data arrives about every
       // 40 ms and used to force the control back before Apply could be tapped.
       const selected=enabledChannels();$("channelTitle").textContent=selected.join("/");$("enabledLive").textContent=selected.map(channel=>"CH"+channel).join("/");
+      if(phoneSource==="raw"&&viewMode==="live"&&Array.isArray(d.raw))appendRawBatch(d);
     } catch(error) { console.warn("Bad scope event",error); }
   };
 
@@ -1217,6 +1269,8 @@
   }, {passive: false});
 
   $("applyButton").addEventListener("click",applySettings);
+  $("snapshotSourceButton").addEventListener("click",()=>setPhoneSource("snapshot"));
+  $("rawSourceButton").addEventListener("click",()=>setPhoneSource("raw"));
   $("autoButton").addEventListener("click",autoSetup);
   $("channel").addEventListener("change",()=>{
     if(manualMode)return;
@@ -1316,16 +1370,20 @@
         if(typeof AbortController!=="undefined"){
           controller=new AbortController();timeout=setTimeout(()=>controller.abort(),2500);
         }
-        const path=lastFetchedFrameId===null?"/api/live":`/api/live?after=${lastFetchedFrameId}`;
+        const requestedSource=phoneSource;
+        const path=`/api/live?raw=${requestedSource==="raw"?1:0}`+(lastFetchedFrameId===null?"":`&after=${lastFetchedFrameId}`);
         const response=await fetch(path,{cache:"no-store",...(controller?{signal:controller.signal}:{})});
         if(response.ok)markConnected();
         if (response.status===200) {
           const frame=CaptureProtocol.decodeLiveFrame(await response.arrayBuffer());
+          if(requestedSource!==phoneSource)return;
           lastFetchedFrameId=frame.id;
           followHardwareFrame(frame);
+          fullScaleMv=frame.fullScaleMv;measuredSampleCycles=frame.samplePeriodCycles;
+          updateScaleLabels();updateVgaTimeControl(false);
           // A frame in transit may precede the latest control change. Keep
           // displaying the last complete window until the new settings arrive.
-          if (frame.mask===channelMask() && frame.focus===Number($("channel").value) &&
+          if (phoneSource==="snapshot"&&!frame.metadataOnly&&frame.mask===channelMask() && frame.focus===Number($("channel").value) &&
               frame.timebase===Number($("timebase").value) &&
               frame.averaging===Number($("acquisitionAverage").value) &&
               (!liveFrame || frame.id!==liveFrame.id)) {
@@ -1338,7 +1396,7 @@
             updateScaleLabels();updateVgaTimeControl(false);drawNeeded=true;
           }
         } else if (response.status!==202 && response.status!==204) throw new Error("Live waveform unavailable. Update both FPGA and Pico firmware.");
-        if (liveFrame) {
+        if (liveFrame&&phoneSource==="snapshot") {
           const age=Math.round(performance.now()-lastLiveFrameAt);
           $("measurementSource").textContent=`Live VGA window · ${enabledChannels().length} channels · updated ${age} ms ago`;
         }
@@ -1346,7 +1404,7 @@
     } catch(error) {
       $("measurementSource").textContent=error.message;
       if(!lastNetworkAt||performance.now()-lastNetworkAt>2500){connected=false;setPill($("wifiPill"),"bad","Reconnecting...");}
-    } finally {clearTimeout(timeout);setTimeout(pollLiveFrame,40);}
+    } finally {clearTimeout(timeout);setTimeout(pollLiveFrame,phoneSource==="raw"?200:40);}
   }
   function frequencyLabel(hz) {
     return hz>=1000 ? `${Number((hz/1000).toPrecision(4))} kHz` : `${Number(hz.toPrecision(4))} Hz`;

@@ -2,8 +2,8 @@
 
 A six-channel oscilloscope built around a DE10-Lite and a Raspberry Pi Pico W.
 The FPGA handles sampling, triggering, timestamped capture, and the 640x480 VGA
-display. The Pico W adds browser controls without putting acquisition timing in
-the browser.
+display. The Pico W hosts the phone interface and relays its controls to the
+FPGA.
 
 This is an experimental instrument. Check the ADC input range and any external
 front end before connecting a signal; the displayed voltage depends on the
@@ -41,7 +41,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\web\embed_web.ps1
 
 `powershell -File tools/build_pico.ps1` embeds the page, compiles with explicit
 Pico W / 133 MHz settings, and updates `output_files/pico_scope.uf2`. Pass
-`-ArduinoCli "path/to/arduino-cli.exe"` if Arduino CLI is not on PATH.
+`-Port COM5` to upload, or `-Uf2Drive E:\` to copy to a BOOTSEL drive.
+The script finds Arduino CLI inside the usual Arduino IDE installation or on
+PATH. See [Pico setup](docs/PICO_SETUP.md) for Arduino IDE and UF2 instructions.
 
 ## What it does
 
@@ -77,6 +79,14 @@ column combines two VGA columns, keeping their mean and both peaks. All enabled
 channels share one time axis. UART transfer adds a small delay; it does not
 change the waveform's sample interval or interrupt VGA acquisition.
 
+The graph has a **VGA snapshot / UART live** toggle. VGA snapshot preserves
+the displayed FPGA waveform. UART live rolls individual readings from the
+existing telemetry stream, with updates scheduled about 30 times per second.
+It is undersampled: its time axis uses Pico receipt timestamps, and fast signals
+can alias. Time and voltage controls remain shared with VGA. A small status
+packet keeps the phone in sync with manual mode without transferring a whole
+waveform. Long raw windows combine readings into bounded min/max buckets.
+
 The linked time controls cover X1 through X1024 decimation. Changing channel
 count or averaging changes the available total times. Both controls update
 their labels without changing the selected decimation. There is no separate
@@ -89,6 +99,11 @@ the phone keep it visible while the next long acquisition fills. Free-run
 continues updating continuously. Long windows still need their actual acquisition
 time to collect a complete record; peak envelopes retain signals that span
 multiple cycles per pixel.
+
+VGA scans at about 60 Hz. A long time window produces new complete columns
+less often; raising the screen refresh rate would not collect them sooner.
+Free-run refreshes the rolling window each frame, while triggered mode holds
+the previous complete record until the next is ready.
 
 **Capture FPGA FFT** samples the current focus channel independently of VGA.
 The FPGA removes the DC offset, applies a Hann window, and runs a scaled

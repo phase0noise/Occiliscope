@@ -26,3 +26,5 @@ jobs:
           python3 tests/fft_math_test.py
           g++ -std=c++11 tests/fft_protocol_test.cpp -o /tmp/fft_protocol_test
           /tmp/fft_protocol_test tests/fixtures/fft_snapshot.bin
+          g++ -std=c++11 tests/telemetry_stream_test.cpp -o /tmp/telemetry_stream_test
+          /tmp/telemetry_stream_test

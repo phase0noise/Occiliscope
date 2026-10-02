@@ -33,6 +33,16 @@ include the last frame ID so unchanged windows return HTTP 204. SW0 manual
 mode makes the phone follow all six channels and the hardware-selected scale.
 Completed triggered views stay visible until the next capture is available.
 
+The graph's source toggle chooses **VGA snapshot** or **UART live**. Snapshot
+uses the complete D7 window described above. UART live uses individual D5 ADC
+readings batched into `/events` about every 33 ms. Pico receipt timestamps place
+the readings on a rolling axis; they are undersampled and can alias. The same
+VGA time window and voltage scale apply. At long time spans, per-channel buckets
+retain the mean and extrema within a bounded history. Compact D9 status replies
+keep manual mode and time controls in sync without starving telemetry with
+large snapshot transfers. Switching sources clears incompatible history, and
+Pause holds the raw plot as well as pausing VGA acquisition.
+
 Capture FPGA FFT requests a 256-sample spectrum from the hardware focus channel.
 Its dedicated graph plots frequency against V peak, with Hann gain correction.
 The default range is up to 10 kHz; narrower ranges improve frequency resolution.

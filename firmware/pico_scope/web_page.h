@@ -73,9 +73,16 @@ h1 { margin: 0; font-size: clamp(20px, 4vw, 30px); letter-spacing: .035em; }
   display: inline-flex; align-items: center; gap: 7px;
   min-height: 30px; padding: 5px 10px; border: 1px solid var(--line);
   border-radius: 999px; background: #0b121c; color: var(--muted);
-  font: 600 12px/1 monospace;
+  font: 600 12px/1 monospace; white-space:nowrap; flex-shrink:0;
 }
+.rate-pill { min-width:82px; justify-content:center; font-variant-numeric:tabular-nums; }
+.graph-source { display:flex; align-items:center; gap:12px; justify-content:space-between; padding:8px 12px; border-bottom:1px solid var(--line); }
+.graph-source .mode-button { min-height:36px; padding:6px 9px; font-size:12px; }
+.graph-source > span { color:var(--muted); font-size:11px; text-align:right; }
+.graph-source[hidden] { display:none; }
 .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--amber); }
+.pill > span { min-width:0; overflow:hidden; text-overflow:ellipsis; }
+.pill .dot { flex-shrink:0; }
 .ok .dot { background: var(--green); }
 .bad .dot { background: var(--red); }
 
@@ -254,7 +261,11 @@ footer { margin-top: 14px; color: var(--muted); text-align: center; font: 11px m
 @media (max-width: 650px) {
   .shell { padding: 10px 10px calc(76px + env(safe-area-inset-bottom)); }
   header { align-items: flex-start; flex-direction: column; }
-  .status-row { justify-content: flex-start; }
+  .status-row { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr) 82px; gap:5px; width:100%; }
+  .status-row .pill { padding:5px 7px; font-size:10px; min-width:0; }
+  .status-row .rate-pill { min-width:82px; }
+  .graph-source { gap:6px; }
+  .graph-source > span { max-width:35%; }
   .canvas-wrap, canvas { min-height: min(330px, 58vh); height: min(330px, 58vh); }
   .measurements { grid-template-columns: repeat(2, 1fr); }
   .measurement:nth-child(even) { border-right: 0; }
@@ -299,7 +310,7 @@ footer { margin-top: 14px; color: var(--muted); text-align: center; font: 11px m
       <div class="status-row">
         <div id="wifiPill" class="pill" role="status" aria-live="polite"><i class="dot"></i><span>Connecting to Pico W</span></div>
         <div id="uartPill" class="pill"><i class="dot"></i><span>Waiting for FPGA</span></div>
-        <div class="pill"><span id="rateText">0 pkt/s</span></div>
+        <div class="pill rate-pill"><span id="rateText">0 pkt/s</span></div>
       </div>
     </header>
 
@@ -351,6 +362,13 @@ footer { margin-top: 14px; color: var(--muted); text-align: center; font: 11px m
               <option value="3">CH3</option><option value="4">CH4</option><option value="5">CH5</option>
             </select>
           </div>
+        <div id="phoneSource" class="graph-source">
+          <div class="mode-switch" role="group" aria-label="Phone waveform source">
+            <button id="snapshotSourceButton" class="mode-button active" aria-pressed="true">VGA snapshot</button>
+            <button id="rawSourceButton" class="mode-button" aria-pressed="false">UART live</button>
+          </div>
+          <span id="phoneSourceHint">Same window as the VGA display</span>
+        </div>
         <div class="canvas-wrap">
           <canvas id="scope" role="img" aria-label="Oscilloscope waveform display"></canvas>
           <div class="readout"><span id="voltageText">0.000 V</span><small id="rawText">ADC 0000</small></div>
@@ -532,7 +550,8 @@ footer { margin-top: 14px; color: var(--muted); text-align: center; font: 11px m
 
   function decodeLiveFrame(input) {
     const bytes = bytesOf(input);
-    if (bytes.length < 34 || bytes[0] !== 0xd7 || bytes[1] !== 1 ||
+    const metadataOnly=bytes[0]===0xd9;
+    if (bytes.length < 34 || (bytes[0] !== 0xd7 && !metadataOnly) || bytes[1] !== 1 ||
         u16(bytes,2) !== bytes.length) throw new Error("Incomplete VGA frame.");
     let crc = 0xffff;
     for (let i=0; i<bytes.length-2; i++) {
@@ -546,12 +565,12 @@ footer { margin-top: 14px; color: var(--muted); text-align: center; font: 11px m
     if (!mask || mask>63 || !(mask & (1<<bytes[5])) || bytes[5]>5 ||
         columns!==288 || !period || bytes[6]>10 || bytes[7]>3 || bytes[8]>100 ||
         bytes[9]>3 || bytes[10]>3 || u16(bytes,16)<1000 || u16(bytes,16)>9999 ||
-        u16(bytes,26)>576 || bytes.length!==34+columns*(1+6*channels.length))
+        u16(bytes,26)>576 || bytes.length!==(metadataOnly?34:34+columns*(1+6*channels.length)))
       throw new Error("Invalid VGA frame settings.");
     const traces=Array.from({length:6},()=>[]);
     const intervalSeconds=period*(2**bytes[6])/50000000;
     let offset=32;
-    for (let column=0; column<columns; column++) {
+    for (let column=0; column<(metadataOnly?0:columns); column++) {
       const valid=bytes[offset++];
       for (const ch of channels) {
         const adc=u16(bytes,offset), low=u16(bytes,offset+2), high=u16(bytes,offset+4);
@@ -568,7 +587,22 @@ footer { margin-top: 14px; color: var(--muted); text-align: center; font: 11px m
       grid:Boolean(bytes[11]&1), stabilize:Boolean(bytes[11]&128),
       triggerLevel:u16(bytes,24), manualMode:Boolean(bytes[28]&1),
       samplePeriodCycles:period, fullScaleMv:u16(bytes,16),
-      windowMs:576*intervalSeconds*1000, traces};
+      windowMs:576*intervalSeconds*1000, metadataOnly, traces};
+  }
+  function decodeRawBatch(data,previousClock=null,previousTime=0) {
+    const clock=data.clockUs;
+    if(!Number.isInteger(clock)||clock<0||clock>0xffffffff||!Array.isArray(data.raw)||data.raw.length>64)
+      throw new Error("Invalid UART live batch.");
+    const delta=previousClock===null?0:(clock-previousClock)>>>0;
+    const reset=previousClock!==null&&delta>10000000;
+    const timeMs=reset?0:previousTime+delta/1000;
+    const samples=data.raw.map(sample=>{
+      if(!Array.isArray(sample)||sample.length!==3||sample.some(value=>!Number.isInteger(value))||
+          sample[0]<0||sample[0]>5||sample[1]<0||sample[1]>4095||sample[2]<0||sample[2]>10000000)
+        throw new Error("Invalid UART live sample.");
+      return {channel:sample[0],adc:sample[1],timeMs:timeMs-sample[2]/1000};
+    });
+    return {clockUs:clock,timeMs,reset,samples,drops:Number(data.drops)||0};
   }
   const ADC_MAX = 4095;
   function decodeFftFrame(input) {
@@ -1022,6 +1056,7 @@ footer { margin-top: 14px; color: var(--muted); text-align: center; font: 11px m
     VGA_PLOT_SAMPLES,
     vgaTimeOptions,
     decodeLiveFrame,
+    decodeRawBatch,
     decodeFftFrame,
     FLAG_COMPLETE,
     FLAG_TRIGGERED,
@@ -1061,6 +1096,8 @@ footer { margin-top: 14px; color: var(--muted); text-align: center; font: 11px m
   let manualMode = false, boardFrameKnown = false;
   let timeOptionsPeriod = 0, timeOptionsKnown = false;
   let fftSnapshot=null, fftBusy=false, fftCancelRequested=false;
+  let phoneSource="snapshot", rawClock=null, rawTimeMs=0, rawViewTimeMs=0, rawWindowMs=0;
+  const rawBuckets=Array.from({length:6},()=>({id:null,sum:0,count:0}));
 
   const $ = id => document.getElementById(id);
   const canvas = $("scope"), ctx = canvas.getContext("2d", {alpha:false});
@@ -1159,7 +1196,51 @@ footer { margin-top: 14px; color: var(--muted); text-align: center; font: 11px m
   function updateChannelButtons(){
     drawNeeded=true;
   }
-  function clearSamples() { for(const trace of traces){trace.head=0;trace.count=0;} drawNeeded=true; }
+  function clearSamples() {
+    for(const trace of traces){trace.head=0;trace.count=0;}
+    for(const bucket of rawBuckets){bucket.id=null;bucket.sum=0;bucket.count=0;}
+    drawNeeded=true;
+  }
+  function appendRawBatch(data) {
+    const batch=CaptureProtocol.decodeRawBatch(data,rawClock,rawTimeMs);
+    if(batch.reset)clearSamples();
+    rawClock=batch.clockUs;rawTimeMs=batch.timeMs;
+    const windowMs=selectedPhoneWindowMs();
+    if(!paused&&Math.abs(windowMs-rawWindowMs)>Math.max(.01,rawWindowMs*.005)) {
+      clearSamples();rawWindowMs=windowMs;
+    }
+    const bucketMs=Math.max(0.001,windowMs/(CAPACITY-1));
+    if(!paused)for(const sample of batch.samples) {
+      if(!(channelMask()&(1<<sample.channel)))continue;
+      const trace=traces[sample.channel],bucket=rawBuckets[sample.channel];
+      const id=Math.floor(sample.timeMs/bucketMs);
+      if(bucket.id!==id) {
+        bucket.id=id;bucket.sum=sample.adc;bucket.count=1;
+        pushSample(sample.channel,sample.adc,sample.adc,sample.adc,sample.timeMs);
+      } else {
+        bucket.sum+=sample.adc;bucket.count++;
+        const index=(trace.head-1+CAPACITY)%CAPACITY;
+        trace.values[index]=Math.round(bucket.sum/bucket.count);
+        trace.lows[index]=Math.min(trace.lows[index],sample.adc);
+        trace.highs[index]=Math.max(trace.highs[index],sample.adc);
+        trace.times[index]=sample.timeMs;trace.latest=sample.adc;
+      }
+    }
+    if(!paused){rawViewTimeMs=rawTimeMs;drawNeeded=true;}
+    $("measurementSource").textContent="UART live · undersampled ADC readings · "+(batch.drops?`${batch.drops} readings skipped by Wi-Fi`:"time uses Pico receipt timestamps");
+  }
+  function setPhoneSource(next) {
+    phoneSource=next==="raw"?"raw":"snapshot";
+    lastFetchedFrameId=null;rawClock=null;rawTimeMs=0;rawViewTimeMs=0;rawWindowMs=0;clearSamples();
+    for(const [id,mode] of [["snapshotSourceButton","snapshot"],["rawSourceButton","raw"]]) {
+      const selected=phoneSource===mode;
+      $(id).classList.toggle("active",selected);$(id).setAttribute("aria-pressed",String(selected));
+    }
+    $("phoneSourceHint").textContent=phoneSource==="raw"?"Undersampled · fast updates":"Same window as the VGA display";
+    if(phoneSource==="snapshot"&&liveFrame)for(let ch=0;ch<6;ch++)for(const point of liveFrame.traces[ch])
+      pushSample(ch,point.adc,point.low,point.high,point.timeMs);
+    drawNeeded=true;
+  }
 
   function resizeCanvas() {
     const rect = canvas.getBoundingClientRect();
@@ -1232,7 +1313,8 @@ footer { margin-top: 14px; color: var(--muted); text-align: center; font: 11px m
     ctx.moveTo(left,top+plotH/2); ctx.lineTo(left+plotW,top+plotH/2);
     ctx.moveTo(left+plotW/2,top); ctx.lineTo(left+plotW/2,top+plotH); ctx.stroke();
 
-    const windowMs = liveFrame ? liveFrame.windowMs : selectedPhoneWindowMs();
+    const raw=phoneSource==="raw";
+    const windowMs = !raw&&liveFrame ? liveFrame.windowMs : selectedPhoneWindowMs();
     if (!(windowMs > 0)) return;
     const triggerMode = $("triggerMode").value;
     const triggerRaw = Number($("triggerLevel").value);
@@ -1240,7 +1322,7 @@ footer { margin-top: 14px; color: var(--muted); text-align: center; font: 11px m
     const focus=Number($("channel").value),focusTrace=traces[focus];
     const enabled=enabledChannels();
 
-    const range={start:0,end:windowMs};
+    const range=raw?{start:rawViewTimeMs-windowMs,end:rawViewTimeMs}:{start:0,end:windowMs};
     let min=ADC_MAX, max=0, visible=0;
     for(let i=0;i<focusTrace.count;i++){const j=indexAt(focusTrace,i),t=focusTrace.times[j];if(t>=range.start&&t<=range.end){if(focusTrace.lows[j]<min)min=focusTrace.lows[j];if(focusTrace.highs[j]>max)max=focusTrace.highs[j];visible++;}}
     if (!visible) { min=0; max=ADC_MAX; }
@@ -1249,13 +1331,13 @@ footer { margin-top: 14px; color: var(--muted); text-align: center; font: 11px m
     let yMin=center-2048/scale,yMax=center+2048/scale;
 
     const yOf = v => top + Math.max(0,Math.min(plotH,plotH-(v-yMin)*plotH/(yMax-yMin)));
-    if(triggerMode!=="free" && triggerRaw>=yMin && triggerRaw<=yMax){ const ty=yOf(triggerRaw); ctx.setLineDash([6*dpr,5*dpr]);ctx.strokeStyle="#ffc85799";ctx.beginPath();ctx.moveTo(left,ty);ctx.lineTo(left+plotW,ty);ctx.stroke();ctx.setLineDash([]); }
-    if(triggerMode!=="free"){const tx=left+plotW*pretrigger;ctx.setLineDash([4*dpr,5*dpr]);ctx.strokeStyle="#ffc85766";ctx.beginPath();ctx.moveTo(tx,top);ctx.lineTo(tx,top+plotH);ctx.stroke();ctx.setLineDash([]);}
+    if(!raw&&triggerMode!=="free" && triggerRaw>=yMin && triggerRaw<=yMax){ const ty=yOf(triggerRaw); ctx.setLineDash([6*dpr,5*dpr]);ctx.strokeStyle="#ffc85799";ctx.beginPath();ctx.moveTo(left,ty);ctx.lineTo(left+plotW,ty);ctx.stroke();ctx.setLineDash([]); }
+    if(!raw&&triggerMode!=="free"){const tx=left+plotW*pretrigger;ctx.setLineDash([4*dpr,5*dpr]);ctx.strokeStyle="#ffc85766";ctx.beginPath();ctx.moveTo(tx,top);ctx.lineTo(tx,top+plotH);ctx.stroke();ctx.setLineDash([]);}
 
     ctx.font=`500 ${12*dpr}px ui-monospace,monospace`;ctx.fillStyle="#c4d4e5";ctx.textAlign="right";
     for(let y=0;y<=4;y++){const raw=yMax-(yMax-yMin)*y/4;ctx.fillText(volts(raw).toFixed(2)+"V",left-6*dpr,top+plotH*y/4+3*dpr);}
     const timeTicks=plotW/dpr<500?4:8;
-    for(let x=0;x<=timeTicks;x++){ctx.textAlign=x===0?"left":x===timeTicks?"right":"center";const relative=triggerMode==="free"?(x/timeTicks-1):(x/timeTicks-pretrigger);const seconds=windowMs*relative/1000;ctx.fillText(formatAxisTime(seconds),left+plotW*x/timeTicks,h-12*dpr);}
+    for(let x=0;x<=timeTicks;x++){ctx.textAlign=x===0?"left":x===timeTicks?"right":"center";const relative=raw||triggerMode==="free"?(x/timeTicks-1):(x/timeTicks-pretrigger);const seconds=windowMs*relative/1000;ctx.fillText(formatAxisTime(seconds),left+plotW*x/timeTicks,h-12*dpr);}
     updateXAxisReadout(windowMs / 1000);
 
     $("traceLegend").innerHTML=enabled.map(ch=>`<span class="trace-chip" style="color:${TRACE_COLORS[ch]}">CH${ch} ${traces[ch].count?volts(traces[ch].latest).toFixed(2)+"V":"--"}${ch===focus?" · FOCUS":""}</span>`).join("");
@@ -1270,10 +1352,11 @@ footer { margin-top: 14px; color: var(--muted); text-align: center; font: 11px m
         bucketMin[column]=Math.min(bucketMin[column],trace.lows[j]);bucketMax[column]=Math.max(bucketMax[column],trace.highs[j]);pointCount++;
       }
       ctx.lineJoin="round";ctx.lineCap="round";
-      if (liveFrame) {
+      if (liveFrame||raw) {
         ctx.beginPath();
         for(let i=0;i<trace.count;i++){
-          const j=indexAt(trace,i),x=left+trace.times[j]*plotW/windowMs;
+          const j=indexAt(trace,i),t=trace.times[j];if(t<range.start||t>range.end)continue;
+          const x=left+(t-range.start)*plotW/windowMs;
           ctx.moveTo(x,yOf(trace.lows[j]));ctx.lineTo(x,yOf(trace.highs[j]));
         }
         ctx.strokeStyle=TRACE_COLORS[ch]+"44";ctx.lineWidth=1*dpr;ctx.stroke();
@@ -1300,7 +1383,7 @@ footer { margin-top: 14px; color: var(--muted); text-align: center; font: 11px m
     $("periodText").textContent=measurement.periodMs?formatPeriodSeconds(measurement.periodMs/1000):"--";
     $("dutyText").textContent=measurement.dutyPercent===null?"-- %":measurement.dutyPercent.toFixed(1)+" %";
     $("samplesText").textContent=String(traces.reduce((total,trace)=>total+trace.count,0));
-    $("triggerText").textContent=(paused?"HOLD · ":"LIVE · ")+triggerMode.toUpperCase();
+    $("triggerText").textContent=raw?(paused?"UART · HOLD":"UART · LIVE"):(paused?"HOLD · ":"LIVE · ")+triggerMode.toUpperCase();
     renderLiveChannelAnalysis(range);
   }
 
@@ -1429,6 +1512,7 @@ footer { margin-top: 14px; color: var(--muted); text-align: center; font: 11px m
     $("liveModeButton").setAttribute("aria-selected", String(live));
     $("captureModeButton").setAttribute("aria-selected", String(!live));
     $("captureCursorReadout").hidden = live || !captureRecord;
+    $("phoneSource").hidden=!live;
     $("measurementSource").textContent = live
       ? "Live VGA window · all enabled channels · mean and peak envelope"
       : "Saved focus capture · acquisition timestamps and peak envelope";
@@ -1500,6 +1584,7 @@ footer { margin-top: 14px; color: var(--muted); text-align: center; font: 11px m
   }
 
   function invalidateWaveform(preserveRecord = false) {
+    if(phoneSource==="raw"&&!preserveRecord)clearSamples();
     autoSnapshotGeneration++;
     if (!preserveRecord) captureRecord = null;
     if (!captureRecord) captureViewport = {
@@ -2169,12 +2254,13 @@ footer { margin-top: 14px; color: var(--muted); text-align: center; font: 11px m
   source.onmessage=event=>{
     try {
       const d=JSON.parse(event.data);lastEventAt=performance.now();
+      markConnected();
       if(Number.isFinite(d.pc)&&d.pc>0){
         measuredSampleCycles=d.pc;
         if(!labeledSampleCycles||Math.abs(measuredSampleCycles-labeledSampleCycles)>Math.max(2,labeledSampleCycles*0.005)){labeledSampleCycles=measuredSampleCycles;updateVgaTimeControl(false);}
       }
       setPill($("uartPill"),d.fresh?"ok":"",""+(d.fresh?"FPGA streaming":"Waiting for FPGA"));
-      $("rateText").textContent=d.pps+" pkt/s";$("packetsText").textContent=d.packets.toLocaleString();
+      $("rateText").textContent=(d.pps>=1000?(d.pps/1000).toFixed(1)+"k":d.pps)+" pkt/s";$("packetsText").textContent=d.packets.toLocaleString();
       $("commandsText").textContent=d.cmds.toLocaleString();
       $("errorsText").textContent=d.errors;$("uptimeText").textContent=Math.floor(d.uptime/1000)+" s";
       $("baudText").textContent=d.baud.toLocaleString();$("footerBaud").textContent=d.baud.toLocaleString()+" baud";
@@ -2182,7 +2268,7 @@ footer { margin-top: 14px; color: var(--muted); text-align: center; font: 11px m
       $("gen2Actual").textContent=formatGeneratorActual(2,d.g1hz,d.g1d,d.g1e);
       $("channelLive").textContent="CH"+$("channel").value;
       const focus=Number($("channel").value),focusRaw=Array.isArray(d.av)?d.av[focus]:d.latest;
-      if(d.vm&(1<<focus)){$("voltageText").textContent=`CH${focus}  ${formatVolts(focusRaw)}`;$("rawText").textContent="ADC "+pad4(focusRaw);}
+      if((d.vm&(1<<focus))&&!(phoneSource==="raw"&&paused)){$("voltageText").textContent=`CH${focus}  ${formatVolts(focusRaw)}`;$("rawText").textContent="ADC "+pad4(focusRaw);}
       if(Array.isArray(d.av))for(let ch=0;ch<3;ch++){
         const active=Boolean(d.vm&(1<<ch)),pair=$("hexCh"+ch),readout=$("previewCh"+ch);
         pair.classList.toggle("disabled",!active);
@@ -2191,6 +2277,7 @@ footer { margin-top: 14px; color: var(--muted); text-align: center; font: 11px m
       // Do not overwrite the channel select here. Data arrives about every
       // 40 ms and used to force the control back before Apply could be tapped.
       const selected=enabledChannels();$("channelTitle").textContent=selected.join("/");$("enabledLive").textContent=selected.map(channel=>"CH"+channel).join("/");
+      if(phoneSource==="raw"&&viewMode==="live"&&Array.isArray(d.raw))appendRawBatch(d);
     } catch(error) { console.warn("Bad scope event",error); }
   };
 
@@ -2259,6 +2346,8 @@ footer { margin-top: 14px; color: var(--muted); text-align: center; font: 11px m
   }, {passive: false});
 
   $("applyButton").addEventListener("click",applySettings);
+  $("snapshotSourceButton").addEventListener("click",()=>setPhoneSource("snapshot"));
+  $("rawSourceButton").addEventListener("click",()=>setPhoneSource("raw"));
   $("autoButton").addEventListener("click",autoSetup);
   $("channel").addEventListener("change",()=>{
     if(manualMode)return;
@@ -2358,16 +2447,20 @@ footer { margin-top: 14px; color: var(--muted); text-align: center; font: 11px m
         if(typeof AbortController!=="undefined"){
           controller=new AbortController();timeout=setTimeout(()=>controller.abort(),2500);
         }
-        const path=lastFetchedFrameId===null?"/api/live":`/api/live?after=${lastFetchedFrameId}`;
+        const requestedSource=phoneSource;
+        const path=`/api/live?raw=${requestedSource==="raw"?1:0}`+(lastFetchedFrameId===null?"":`&after=${lastFetchedFrameId}`);
         const response=await fetch(path,{cache:"no-store",...(controller?{signal:controller.signal}:{})});
         if(response.ok)markConnected();
         if (response.status===200) {
           const frame=CaptureProtocol.decodeLiveFrame(await response.arrayBuffer());
+          if(requestedSource!==phoneSource)return;
           lastFetchedFrameId=frame.id;
           followHardwareFrame(frame);
+          fullScaleMv=frame.fullScaleMv;measuredSampleCycles=frame.samplePeriodCycles;
+          updateScaleLabels();updateVgaTimeControl(false);
           // A frame in transit may precede the latest control change. Keep
           // displaying the last complete window until the new settings arrive.
-          if (frame.mask===channelMask() && frame.focus===Number($("channel").value) &&
+          if (phoneSource==="snapshot"&&!frame.metadataOnly&&frame.mask===channelMask() && frame.focus===Number($("channel").value) &&
               frame.timebase===Number($("timebase").value) &&
               frame.averaging===Number($("acquisitionAverage").value) &&
               (!liveFrame || frame.id!==liveFrame.id)) {
@@ -2380,7 +2473,7 @@ footer { margin-top: 14px; color: var(--muted); text-align: center; font: 11px m
             updateScaleLabels();updateVgaTimeControl(false);drawNeeded=true;
           }
         } else if (response.status!==202 && response.status!==204) throw new Error("Live waveform unavailable. Update both FPGA and Pico firmware.");
-        if (liveFrame) {
+        if (liveFrame&&phoneSource==="snapshot") {
           const age=Math.round(performance.now()-lastLiveFrameAt);
           $("measurementSource").textContent=`Live VGA window · ${enabledChannels().length} channels · updated ${age} ms ago`;
         }
@@ -2388,7 +2481,7 @@ footer { margin-top: 14px; color: var(--muted); text-align: center; font: 11px m
     } catch(error) {
       $("measurementSource").textContent=error.message;
       if(!lastNetworkAt||performance.now()-lastNetworkAt>2500){connected=false;setPill($("wifiPill"),"bad","Reconnecting...");}
-    } finally {clearTimeout(timeout);setTimeout(pollLiveFrame,40);}
+    } finally {clearTimeout(timeout);setTimeout(pollLiveFrame,phoneSource==="raw"?200:40);}
   }
   function frequencyLabel(hz) {
     return hz>=1000 ? `${Number((hz/1000).toPrecision(4))} kHz` : `${Number(hz.toPrecision(4))} Hz`;

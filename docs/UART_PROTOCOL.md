@@ -87,3 +87,21 @@ timebase up to X1024; KEY1 decrements it down to X1. The buttons are debounced
 for 10 ms. UART timebase commands are ignored while manual mode is active;
 voltage gain, position, calibration, and grid commands still apply. SW0 down
 restores the phone-selected channel and trigger settings at the current timebase.
+
+## Compact hardware status
+
+`AE` requests a D9 status packet. It uses the same 32-byte header fields as D7
+and a two-byte CRC-16/CCITT-FALSE, with magic D9 and total length 34. It carries
+the channel mask, focus, scale, trigger settings, measured sample period,
+calibration, and manual mode. The column-count field remains 288 to describe
+the associated VGA view, but no column payload follows. Status is latched at
+the next VGA frame boundary and is available while a triggered waveform is held.
+
+UART live requests this small status packet about every 250 ms instead of
+full D7 windows. Individual D5 readings continue between packets. The Pico
+batches them into server-sent events about every 33 ms, with a 64-reading queue;
+overflow retains the newest readings and reports a dropped count. Each entry
+is `[channel, adc, age_us]` relative to the event's `clockUs`. These timestamps
+measure arrival at the Pico, rather than the original ADC conversion. Unsigned
+subtraction handles the 32-bit micros wrap. Saved captures and FFT still use
+their FPGA timestamps and checked binary packets.

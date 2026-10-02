@@ -5,6 +5,11 @@
 
 #include "capture_protocol.h"
 #include "fft_protocol.h"
+#include "telemetry_stream.h"
+
+#if !defined(ARDUINO_RASPBERRY_PI_PICO_W)
+#error "Select Raspberry Pi Pico W in Arduino IDE; this sketch needs its Wi-Fi hardware."
+#endif
 
 #if __has_include(<hardware/watchdog.h>)
 #include <hardware/watchdog.h>
@@ -29,6 +34,7 @@ constexpr uint8_t ADC_CHANNEL_COUNT = 6;
 
 // Status needs fewer updates than waveforms. Keep Wi-Fi capacity for live data.
 constexpr uint32_t SSE_INTERVAL_MS = 100;
+constexpr uint32_t RAW_SSE_INTERVAL_MS = 33;
 constexpr uint32_t SSE_STALL_TIMEOUT_MS = 6000;
 
 constexpr uint32_t HTTP_READ_TIMEOUT_MS = 1200;
@@ -124,7 +130,7 @@ size_t httpBodyOffset = 0;
 bool httpPromoteToEvents = false;
 char captureStatusBody[HTTP_RESPONSE_SIZE] = {};
 
-char sseMessage[1600] = {};
+char sseMessage[4096] = {};
 size_t sseMessageLength = 0;
 size_t sseMessageOffset = 0;
 uint32_t lastSseSendMillis = 0;
@@ -154,6 +160,8 @@ struct ChannelBucket {
 };
 
 ChannelBucket channelBuckets[ADC_CHANNEL_COUNT] = {};
+OcciliStream::SampleQueue rawSamples;
+bool rawStreamMode=false;
 
 // UART arrival samples alias fast signals. Receive a held VGA window instead.
 // HTTP reads one buffer while the next frame fills the other.
@@ -165,6 +173,8 @@ uint16_t liveIndex = 0, liveExpected = 0, liveCrc = 0xffff;
 bool liveRequested = false;
 uint32_t liveRequestMillis = 0, liveByteMillis = 0;
 uint32_t liveClientMillis = 0;
+uint8_t boardStatus[34]={}, boardStatusHttp[34]={};
+bool boardStatusReady=false;
 
 uint16_t liveCrcByte(uint16_t crc, uint8_t byte) {
   crc ^= static_cast<uint16_t>(byte) << 8;
@@ -180,7 +190,8 @@ void acceptLiveByte(uint8_t byte) {
   if (liveIndex <= 4 || liveIndex <= liveExpected - 2) liveCrc = liveCrcByte(liveCrc, byte);
   if (liveIndex == 4) {
     liveExpected = frame[2] | (static_cast<uint16_t>(frame[3]) << 8);
-    if (frame[1] != 1 || liveExpected < 34 || liveExpected > LIVE_FRAME_MAX_BYTES) {
+    if (frame[1] != 1 || liveExpected < 34 || liveExpected > LIVE_FRAME_MAX_BYTES ||
+        (frame[0]==0xd9 && liveExpected!=34)) {
       liveIndex = 0; liveRequested = false; return;
     }
   }
@@ -193,9 +204,13 @@ void acceptLiveByte(uint8_t byte) {
         (frame[4] & (1U << frame[5])) && frame[6] <= 10 && frame[7] <= 3 &&
         frame[8] <= 100 && frame[9] <= 3 && frame[10] <= 3 &&
         frame[18] == 0x20 && frame[19] == 1 &&
-        liveExpected == 34 + 288 * (1 + 6 * channels)) {
-      liveLengths[liveReceiving] = liveExpected;
-      liveReady = liveReceiving;
+        (frame[0]==0xd9 ? liveExpected==34 : liveExpected==34+288*(1+6*channels))) {
+      if(frame[0]==0xd9) {
+        memcpy(boardStatus,frame,sizeof(boardStatus));boardStatusReady=true;
+      } else {
+        liveLengths[liveReceiving] = liveExpected;
+        liveReady = liveReceiving;
+      }
       telemetry.lastPacketMillis = millis();
       telemetry.valid = true;
     } else telemetry.invalidLineCount++;
@@ -425,6 +440,7 @@ void acceptFpgaSample(uint16_t value,uint8_t confirmedChannel,uint16_t adc,
   else if(bucket.count<64){bucket.sum+=adc;bucket.count++;if(adc<bucket.low)bucket.low=adc;if(adc>bucket.high)bucket.high=adc;}
   else{bucket.sum=adc;bucket.count=1;bucket.low=adc;bucket.high=adc;}
   bucket.latest=adc;bucket.valid=true;
+  if(rawStreamMode)rawSamples.push(confirmedChannel,adc,micros());
 
 }
 
@@ -808,7 +824,8 @@ void serviceLiveFrames() {
   // A response may still hold the previous frame after the published slot
   // changes. Do not reuse that slot until its HTTP body has been sent.
   if (httpBody == reinterpret_cast<const char*>(liveFrames[1-liveReady])) return;
-  const uint8_t command = 0xab;
+  if(rawStreamMode && millis()-liveRequestMillis<250)return;
+  const uint8_t command = rawStreamMode ? 0xae : 0xab;
   if (Serial1.write(command) == 1) {
     liveRequested = true; liveRequestMillis = millis();
   }
@@ -849,7 +866,7 @@ void readFpgaUart() {
       fftLastByteMillis=millis();fftParser.feed(incomingByte,acceptFftFrame);continue;
     }
 
-    if (liveIndex || (incomingByte == 0xd7 && binaryTelemetryIndex == 0 &&
+    if (liveIndex || ((incomingByte == 0xd7 || incomingByte == 0xd9) && binaryTelemetryIndex == 0 &&
                       !captureFrameParser.active())) {
       if (!liveIndex) {
         liveReceiving = 1 - liveReady; liveExpected = 0; liveCrc = 0xffff;
@@ -1277,12 +1294,14 @@ void routeHttpRequest() {
 
   if (startsWith(httpRequestLine, "GET /api/live")) {
     liveClientMillis = millis();
-    const size_t length = liveLengths[liveReady];
+    uint16_t raw=0;readQueryValue(httpRequestLine,"raw",1,raw);
+    if(rawStreamMode != (raw==1)) { rawStreamMode=raw==1;rawSamples.clear(); }
+    const size_t length = rawStreamMode ? (boardStatusReady ? sizeof(boardStatus) : 0) : liveLengths[liveReady];
     if (!length) {
       queueSmallResponse(202,"Accepted","application/json","{\"waiting\":true}");
       return;
     }
-    const uint8_t* frame = liveFrames[liveReady];
+    const uint8_t* frame = rawStreamMode ? boardStatus : liveFrames[liveReady];
     const uint32_t id = static_cast<uint32_t>(frame[20]) |
         (static_cast<uint32_t>(frame[21]) << 8) |
         (static_cast<uint32_t>(frame[22]) << 16) |
@@ -1298,7 +1317,8 @@ void routeHttpRequest() {
         static_cast<unsigned long>(length));
     httpResponseLength = written > 0 ? static_cast<size_t>(written) : 0;
     httpResponseOffset = 0;
-    httpBody = reinterpret_cast<const char*>(liveFrames[liveReady]);
+    if(rawStreamMode)memcpy(boardStatusHttp,boardStatus,sizeof(boardStatusHttp));
+    httpBody = reinterpret_cast<const char*>(rawStreamMode ? boardStatusHttp : liveFrames[liveReady]);
     httpBodyLength = length; httpBodyOffset = 0; httpPromoteToEvents = false;
     httpLastProgressMillis = millis(); httpState = HTTP_SENDING;
     return;
@@ -1648,6 +1668,22 @@ void prepareTelemetryEvent(uint32_t now) {
   if(written<=0||written>=static_cast<int>(sizeof(sseMessage))){sseMessageLength=0;return;}
 
   size_t length=static_cast<size_t>(written);
+  if(rawStreamMode) {
+    const uint32_t clockUs=micros();
+    written=snprintf(sseMessage+length,sizeof(sseMessage)-length,
+      "\"clockUs\":%lu,\"drops\":%lu,\"raw\":[",static_cast<unsigned long>(clockUs),
+      static_cast<unsigned long>(rawSamples.dropped()));
+    if(written<=0 || written>=static_cast<int>(sizeof(sseMessage)-length)){sseMessageLength=0;return;}
+    length+=static_cast<size_t>(written);
+    OcciliStream::Sample sample;bool first=true;
+    while(rawSamples.pop(sample)) {
+      written=snprintf(sseMessage+length,sizeof(sseMessage)-length,"%s[%u,%u,%lu]",
+        first?"":",",sample.channel,sample.adc,static_cast<unsigned long>(clockUs-sample.micros));
+      if(written<=0 || written>=static_cast<int>(sizeof(sseMessage)-length)){sseMessageLength=0;return;}
+      length+=static_cast<size_t>(written);first=false;
+    }
+    sseMessage[length++]=']';sseMessage[length++]=',';
+  }
   written=snprintf(
       sseMessage+length,sizeof(sseMessage)-length,
       "\"latest\":%u,\"value\":%u,\"ch\":%u,\"pc\":%lu,\"packets\":%lu,\"pps\":%lu,"
@@ -1681,7 +1717,8 @@ void serviceEvents() {
   }
 
   const uint32_t now = millis();
-  if (sseMessageLength == 0 && now - lastSseSendMillis >= SSE_INTERVAL_MS) {
+  const uint32_t interval=rawStreamMode ? RAW_SSE_INTERVAL_MS : SSE_INTERVAL_MS;
+  if (sseMessageLength == 0 && now - lastSseSendMillis >= interval) {
     prepareTelemetryEvent(now);
   }
 

@@ -2,7 +2,7 @@
 // acquisition. Two adjacent VGA columns become one phone column, preserving
 // both extrema and the mean. All enabled channels share the same time axis.
 module scope_live (
-    input wire clk, reset, request, frame_begin,
+    input wire clk, reset, request, metadata_request, frame_begin, snapshot_ready,
     input wire column_write,
     input wire [9:0] column_index,
     input wire [71:0] column_mean, column_min, column_max,
@@ -21,7 +21,7 @@ module scope_live (
     output wire tx_valid,
     input wire tx_pop
 );
-    reg pending, copying, sending;
+    reg pending, pending_metadata, copying, sending;
     reg [5:0] mask, first_valid;
     reg [71:0] first_mean, first_min, first_max;
     reg [71:0] means [0:511] /* synthesis ramstyle = "M9K" */;
@@ -124,18 +124,26 @@ module scope_live (
 
     always @(posedge clk) begin
         if (reset) begin
-            pending <= 0; copying <= 0; sending <= 0;
+            pending <= 0; pending_metadata <= 0; copying <= 0; sending <= 0;
             frame_id <= 0; byte_index <= 0; packet_length <= 0;
             read_column <= 0; read_channel <= 0; field_index <= 0;
             mask_byte <= 1; crc <= 16'hffff; mask <= 1;
         end else begin
-            if (request && !copying && !sending) pending <= 1;
-            if (frame_begin && pending && !copying && !sending) begin
-                pending <= 0; copying <= 1; mask <= channel_mask;
+            if ((request || metadata_request) && !copying && !sending) begin
+                pending <= 1; pending_metadata <= metadata_request;
+            end
+            // A 34-byte status reply keeps manual controls visible without
+            // occupying UART with a complete window during the phone raw view.
+            if (frame_begin && pending && (pending_metadata || snapshot_ready) && !copying && !sending) begin
+                pending <= 0; copying <= !pending_metadata; mask <= channel_mask;
+                if (pending_metadata) begin
+                    sending <= 1; byte_index <= 0; crc <= 16'hffff;
+                end
                 frame_id <= frame_id + 1'b1;
-                packet_length <= length;
-                header[0] <= 8'hd7; header[1] <= 1;
-                header[2] <= length[7:0]; header[3] <= {2'd0,length[13:8]};
+                packet_length <= pending_metadata ? 14'd34 : length;
+                header[0] <= pending_metadata ? 8'hd9 : 8'hd7; header[1] <= 1;
+                header[2] <= pending_metadata ? 8'd34 : length[7:0];
+                header[3] <= pending_metadata ? 8'd0 : {2'd0,length[13:8]};
                 header[4] <= {2'd0,channel_mask}; header[5] <= {5'd0,focus};
                 header[6] <= {4'd0,timebase}; header[7] <= {6'd0,scale};
                 header[8] <= {1'b0,position}; header[9] <= {6'd0,trigger_mode};

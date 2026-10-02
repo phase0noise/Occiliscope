@@ -19,7 +19,7 @@
       <div class="status-row">
         <div id="wifiPill" class="pill" role="status" aria-live="polite"><i class="dot"></i><span>Connecting to Pico W</span></div>
         <div id="uartPill" class="pill"><i class="dot"></i><span>Waiting for FPGA</span></div>
-        <div class="pill"><span id="rateText">0 pkt/s</span></div>
+        <div class="pill rate-pill"><span id="rateText">0 pkt/s</span></div>
       </div>
     </header>
 
@@ -71,6 +71,13 @@
               <option value="3">CH3</option><option value="4">CH4</option><option value="5">CH5</option>
             </select>
           </div>
+        <div id="phoneSource" class="graph-source">
+          <div class="mode-switch" role="group" aria-label="Phone waveform source">
+            <button id="snapshotSourceButton" class="mode-button active" aria-pressed="true">VGA snapshot</button>
+            <button id="rawSourceButton" class="mode-button" aria-pressed="false">UART live</button>
+          </div>
+          <span id="phoneSourceHint">Same window as the VGA display</span>
+        </div>
         <div class="canvas-wrap">
           <canvas id="scope" role="img" aria-label="Oscilloscope waveform display"></canvas>
           <div class="readout"><span id="voltageText">0.000 V</span><small id="rawText">ADC 0000</small></div>

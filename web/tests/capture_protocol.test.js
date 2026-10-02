@@ -232,3 +232,32 @@ test("FFT rejects truncated, corrupted, failed and inconsistent snapshots",()=>{
   const precision=fftFixture();precision[31]=7;fftChecksum(precision);
   assert.throws(()=>protocol.decodeFftFrame(precision),/metadata/);
 });
+
+test("compact board status follows manual time controls without a waveform payload",()=>{
+  const bytes=new Uint8Array(34);
+  bytes.set([0xd9,1,34,0,63,0,7,1,50,0,1,3]);
+  put32(bytes,12,4800);put16(bytes,16,5000);put16(bytes,18,288);
+  put32(bytes,20,91);put16(bytes,24,2048);put16(bytes,26,576);bytes[28]=1;
+  let crc=0xffff;
+  for(let i=0;i<32;i++) {
+    crc^=bytes[i]<<8;
+    for(let bit=0;bit<8;bit++)crc=((crc<<1)^((crc&0x8000)?0x1021:0))&0xffff;
+  }
+  put16(bytes,32,crc);
+  const status=protocol.decodeLiveFrame(bytes);
+  assert.equal(status.metadataOnly,true);assert.equal(status.manualMode,true);
+  assert.equal(status.timebase,7);assert.equal(status.mask,63);
+  assert.ok(status.traces.every(trace=>trace.length===0));
+  bytes[6]^=1;assert.throws(()=>protocol.decodeLiveFrame(bytes),/checksum/);
+});
+
+test("UART live batches preserve sample order and handle micros wrap and restart",()=>{
+  const batch=protocol.decodeRawBatch({clockUs:1000,raw:[[0,1000,300],[1,3000,0]],drops:4},0xffffff00,9);
+  assert.equal(batch.timeMs,10.256);assert.equal(batch.reset,false);
+  assert.deepEqual(batch.samples.map(sample=>sample.channel),[0,1]);
+  assert.ok(Math.abs(batch.samples[0].timeMs-9.956)<1e-9);
+  assert.equal(batch.drops,4);
+  const restarted=protocol.decodeRawBatch({clockUs:10,raw:[]},50000,100);
+  assert.equal(restarted.reset,true);assert.equal(restarted.timeMs,0);
+  assert.throws(()=>protocol.decodeRawBatch({clockUs:10,raw:[[6,1000,0]]}),/Invalid/);
+});

@@ -32,18 +32,18 @@ let requested = false, polls = 0, dataReads = 0;
 let liveId = 0, fftPolls = 0, fftId = 6, fftCancels = 0;
 window.fftCancelCheck = false;
 const fftArtifact = Uint8Array.from(${JSON.stringify([...fftArtifact])});
-function liveArtifact() {
+function liveArtifact(metadataOnly=false) {
   const mask=[...document.querySelectorAll('.channel-check:checked')].reduce((m,ch)=>m|(1<<ch.value),0);
   const channels=Array.from({length:6},(_,ch)=>ch).filter(ch=>mask&(1<<ch));
-  const bytes=new Uint8Array(34+288*(1+6*channels.length)), view=new DataView(bytes.buffer);
-  bytes[0]=0xd7;bytes[1]=1;view.setUint16(2,bytes.length,true);
+  const bytes=new Uint8Array(metadataOnly?34:34+288*(1+6*channels.length)), view=new DataView(bytes.buffer);
+  bytes[0]=metadataOnly?0xd9:0xd7;bytes[1]=1;view.setUint16(2,bytes.length,true);
   bytes[4]=mask;bytes[5]=Number(document.getElementById('channel').value);
   bytes[6]=Number(document.getElementById('timebase').value);
   bytes[7]=Number(document.getElementById('vertical').value);bytes[8]=50;bytes[9]=3;bytes[10]=1;bytes[11]=7;
   view.setUint32(12,2000,true);view.setUint16(16,5000,true);view.setUint16(18,288,true);
   view.setUint32(20,++liveId,true);view.setUint16(24,2048,true);view.setUint16(26,576,true);
   let offset=32;
-  for(let column=0;column<288;column++) {
+  for(let column=0;column<(metadataOnly?0:288);column++) {
     bytes[offset++]=mask;
     for(const ch of channels) {
       const value=ch===0?(column%32<16?1000:3000):ch===1?Math.round(2048+700*Math.sin(column*Math.PI/16)):700+column*6;
@@ -63,7 +63,7 @@ window.fetch = async function(url) {
   if (url.startsWith('/api/fft/status')) return json({state:window.fftCancelCheck||++fftPolls<2?'running':'ready'});
   if (url.startsWith('/api/fft/data')) return new Response(fftArtifact);
   if (url.startsWith('/api/fft/cancel')) {fftCancels++;return json({state:'cancelled'});}
-  if (url.startsWith('/api/live')) return new Response(liveArtifact());
+  if (url.startsWith('/api/live')) return new Response(liveArtifact(new URL(url,location.href).searchParams.get('raw')==='1'));
   if (url === '/api/capture/download') { requested = true; return json({sent:true, state:'receiving', complete:false}); }
   if (url === '/api/capture/status') {
     if (requested) polls++;
@@ -84,9 +84,9 @@ window.fetch = async function(url) {
   return json({sent:true});
 };
 addEventListener('load', () => {
-  const telemetry = pc => window.scopeEvents.onmessage({data:JSON.stringify({
-    pc, fresh:true, pps:100, packets:100, cmds:0, errors:0, uptime:1000,
-    baud:115200, ch:0, vm:1, av:[1000,0,0,0,0,0]
+  const telemetry = (pc,extra={}) => window.scopeEvents.onmessage({data:JSON.stringify({
+    pc, fresh:true, pps:1250, packets:100, cmds:0, errors:0, uptime:1000,
+    baud:115200, ch:0, vm:1, av:[1000,0,0,0,0,0],...extra
   })});
   window.scopeEvents.onopen();
   telemetry(1000);
@@ -98,6 +98,13 @@ addEventListener('load', () => {
   if (slider.value !== '2') window.smokeErrors.push('Dropdown did not update slider');
   telemetry(2000);
   setInterval(()=>telemetry(2000),300);
+  let rawClock=0xffffff00;
+  setInterval(()=>{
+    if(document.getElementById('rawSourceButton').getAttribute('aria-pressed')!=='true')return;
+    rawClock=(rawClock+33000)>>>0;
+    const raw=Array.from({length:42},(_,n)=>[n%3,Math.round(2048+700*Math.sin(n*.4)),(41-n)*750]);
+    telemetry(2000,{clockUs:rawClock,raw,drops:0});
+  },33);
   if (select.value !== '2' || !select.selectedOptions[0].textContent.includes('92.16 ms')) {
     window.smokeErrors.push('Time labels did not follow acquisition interval');
   }
@@ -142,9 +149,15 @@ addEventListener('load', () => {
       setTimeout(()=>{
         if(fftCancels!==1 || document.getElementById('fftButton').disabled)window.smokeErrors.push('FFT cancel did not complete');
         if(document.getElementById('fftDetails').textContent!==details)window.smokeErrors.push('Cancel cleared the previous spectrum');
-        const result = document.createElement('pre'); result.id = 'smoke-result';
-        result.textContent = window.smokeErrors.length ? 'FAIL: ' + window.smokeErrors.join('; ') : 'PASS';
-        document.body.appendChild(result);
+        document.getElementById('rawSourceButton').click();
+        setTimeout(()=>{
+          if(!window.scopeRequests.some(url=>url.startsWith('/api/live?raw=1')))window.smokeErrors.push('UART live did not request compact hardware status');
+          if(!document.getElementById('triggerText').textContent.includes('UART') || Number(document.getElementById('samplesText').textContent)<3)window.smokeErrors.push('UART readings did not reach the live graph');
+          document.getElementById('snapshotSourceButton').click();
+          const result = document.createElement('pre'); result.id = 'smoke-result';
+          result.textContent = window.smokeErrors.length ? 'FAIL: ' + window.smokeErrors.join('; ') : 'PASS';
+          document.body.appendChild(result);
+        },500);
         document.documentElement.dataset.smoke = window.smokeErrors.length ? 'FAIL' : 'PASS';
       },500);
     },850);
