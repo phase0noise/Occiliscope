@@ -11,39 +11,8 @@ calibration setting.
 
 ## Hardware and tools
 
-- Terasic DE10-Lite, Raspberry Pi Pico W, VGA monitor
-- Two 3.3 V UART wires and a common ground
-- Quartus Prime Lite 23.1 for the FPGA
-- Arduino IDE with the `arduino-pico` RP2040 core for the Pico W
-
-## Build and connect
-
-1. Open `oscilloscope.qpf` in Quartus and compile, or run
-   `powershell -File tools/build_fpga.ps1`. Program the resulting
-   `oscilloscope.sof` onto the DE10-Lite. The script writes its output under
-   `output_files/`.
-2. Flash `output_files/pico_scope.uf2` to the Pico W using BOOTSEL, or upload
-   `firmware/pico_scope/pico_scope.ino` from Arduino IDE. Select **Raspberry Pi
-   Pico W**, the **arduino-pico 6.0.0** core, and **133 MHz** CPU speed.
-   It creates the **PicoScope** access point with password **picoscope** and
-   prints its address on USB serial. The Wi-Fi configuration is unchanged.
-3. Connect Pico GP0 (TX) to DE10-Lite `GPIO[8]` (FPGA RX), Pico GP1 (RX) to
-   `GPIO[4]` (FPGA TX), and the board grounds together. Use 3.3 V logic.
-4. Connect to the Pico access point and open the address printed on USB serial.
-   UART runs at a fixed **115200 baud** on both boards; SW8 is reserved.
-
-The web page is built into the Pico firmware. After editing files in `web/`,
-regenerate `firmware/pico_scope/web_page.h` before compiling the sketch:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\web\embed_web.ps1
-```
-
-`powershell -File tools/build_pico.ps1` embeds the page, compiles with explicit
-Pico W / 133 MHz settings, and updates `output_files/pico_scope.uf2`. Pass
-`-Port COM5` to upload, or `-Uf2Drive E:\` to copy to a BOOTSEL drive.
-The script finds Arduino CLI inside the usual Arduino IDE installation or on
-PATH. See [Pico setup](docs/PICO_SETUP.md) for Arduino IDE and UF2 instructions.
+<img width="720" height="1600" alt="1000000149" src="https://github.com/user-attachments/assets/9c41206b-49a3-4473-9a1f-4cd15f81b561" />
+<img width="4000" height="3000" alt="unnamed11" src="https://github.com/user-attachments/assets/d149edf8-5ab9-4d9b-9a5c-0ae8a2cb3679" />
 
 ## What it does
 
@@ -135,6 +104,35 @@ it supports short envelope snapshots and 8,192-sample deep captures.
 Rebuild and program both the FPGA and Pico firmware when updating this revision.
 Snapshot packets use v2 mean/min/max records; deep captures retain v1.
 
+
+## Build and connect
+
+1. Open `oscilloscope.qpf` in Quartus and Program the resulting
+   `oscilloscope.sof` onto the DE10-Lite. 
+2. Flash `output_files/pico_scope.uf2` to the Pico W using BOOTSEL, or upload
+   `firmware/pico_scope/pico_scope.ino` from Arduino IDE. Select **Raspberry Pi
+   Pico W**, the **arduino-pico 6.0.0** core, and **133 MHz** CPU speed.
+   It creates the **PicoScope** access point with password **picoscope** and
+   prints its address on USB serial. The Wi-Fi configuration is unchanged.
+3. Connect Pico GP0 (TX) to DE10-Lite `GPIO[8]` (FPGA RX), Pico GP1 (RX) to
+   `GPIO[4]` (FPGA TX), and the board grounds together. Use 3.3 V logic.
+4. Connect to the Pico access point and open the address printed on USB serial.
+   UART runs at a fixed **115200 baud** on both boards; SW8 is reserved.
+
+The web page is built into the Pico firmware. After editing files in `web/`,
+regenerate `firmware/pico_scope/web_page.h` before compiling the sketch:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\web\embed_web.ps1
+```
+
+`powershell -File tools/build_pico.ps1` embeds the page, compiles with explicit
+Pico W / 133 MHz settings, and updates `output_files/pico_scope.uf2`. Pass
+`-Port COM5` to upload, or `-Uf2Drive E:\` to copy to a BOOTSEL drive.
+The script finds Arduino CLI inside the usual Arduino IDE installation or on
+PATH. See [Pico setup](docs/PICO_SETUP.md) for Arduino IDE and UF2 instructions.
+
+
 ## Source map
 
 | Path | Purpose |
@@ -161,17 +159,3 @@ See [UART control and telemetry](docs/UART_PROTOCOL.md),
 [capture format](docs/CAPTURE_PROTOCOL.md), and
 [validation notes](docs/VALIDATION.md) for protocol details and checks.
 
-## Development
-
-Edit the browser sources in `web/`, then regenerate the embedded header using
-the command above. Node.js 20 or newer runs the browser tests without installing
-packages:
-
-```powershell
-npm test
-```
-
-`node tools/prepare_browser_smoke.cjs` creates an offline page at
-`.cache/browser/smoke.html` that exercises the time controls and capture download.
-Open it in Chromium to check the waveform renderer. Build files and local
-browser profiles stay outside the tracked source files.
