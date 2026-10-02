@@ -8,7 +8,7 @@ FPGA.
 This is an experimental instrument. Check the ADC input range and any external
 front end before connecting a signal; DE10-Lite supports 5V max
 
-## Hardware and tools
+## Pictures
 
 <img width="720" height="1600" alt="1000000149" src="https://github.com/user-attachments/assets/9c41206b-49a3-4473-9a1f-4cd15f81b561" />
 <img width="4000" height="3000" alt="unnamed11" src="https://github.com/user-attachments/assets/d149edf8-5ab9-4d9b-9a5c-0ae8a2cb3679" />
