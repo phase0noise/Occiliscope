@@ -6,7 +6,7 @@ display. The Pico W hosts the phone interface and relays its controls to the
 FPGA.
 
 This is an experimental instrument. Check the ADC input range and any external
-front end before connecting a signal; DE10-Lite supports 5V max
+front end before connecting a signal; DE10-Lite supports 5V max. This is not a calibrated scientific instrument. Feel free to use or modify the code. 
 
 ## Pictures
 
